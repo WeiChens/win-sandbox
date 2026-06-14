@@ -39,6 +39,9 @@ bool DetourUninstall(DetourContext* ctx);
 /// 卸载所有已安装的 hook（在 DLL_PROCESS_DETACH 调用）
 void DetourUninstallAll();
 
+/// 检查地址是否在任何跳板内存区域内（VEH 使用）
+bool IsAddressInTrampoline(const BYTE* addr);
+
 /// 获取指令长度（x64 + x86）
 int GetInstructionLen(BYTE* src);
 

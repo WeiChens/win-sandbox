@@ -23,6 +23,7 @@
 #include "utils.h"
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -65,6 +66,15 @@ static std::mutex g_track_mutex;
 static std::vector<TrackedProcess> g_tracked;
 static CRITICAL_SECTION g_track_cs;
 static bool g_track_cs_initialized = false;
+
+// DLL 路径缓存（从环境变量读取）
+static std::wstring g_dllPathX64;
+static std::wstring g_dllPathX86;
+static std::wstring g_dllPathSelf;
+
+// WOW64 LoadLibraryW 地址缓存
+static uint32_t g_wow64LoadLibraryW = 0;
+static bool g_wow64LoadLibraryW_resolved = false;
 
 // ============================================================================
 // 原始函数指针
@@ -125,18 +135,201 @@ std::wstring GetCurrentDllPath() {
 }
 
 // ============================================================================
+// DLL 路径管理
+// ============================================================================
+
+void CacheDllPaths() {
+    // 自身路径
+    g_dllPathSelf = GetCurrentDllPath();
+
+    // 从环境变量读取 x64/x86 路径
+    wchar_t buf[MAX_PATH] = {0};
+    if (GetEnvironmentVariableW(L"SBOX_DLL_PATH_X64", buf, MAX_PATH) > 0) {
+        g_dllPathX64 = buf;
+    } else {
+        g_dllPathX64 = g_dllPathSelf; // fallback
+    }
+
+    ZeroMemory(buf, sizeof(buf));
+    if (GetEnvironmentVariableW(L"SBOX_DLL_PATH_X86", buf, MAX_PATH) > 0) {
+        g_dllPathX86 = buf;
+    } else {
+        g_dllPathX86 = g_dllPathSelf; // fallback
+    }
+
+    char dbg[512];
+    snprintf(dbg, sizeof(dbg), "[sandbox_hook] DLL paths cached:\n  self=%ls\n  x64=%ls\n  x86=%ls\n",
+             g_dllPathSelf.c_str(), g_dllPathX64.c_str(), g_dllPathX86.c_str());
+    OutputDebugStringA(dbg);
+}
+
+std::wstring GetDllPathForArch(bool isWow64) {
+    if (isWow64) {
+        return g_dllPathX86.empty() ? g_dllPathSelf : g_dllPathX86;
+    }
+    return g_dllPathX64.empty() ? g_dllPathSelf : g_dllPathX64;
+}
+
+// ============================================================================
+// GetWow64LoadLibraryW — 获取 32 位 kernel32!LoadLibraryW 地址
+//
+// 原理：
+//   - 创建 32 位辅助进程 (C:\Windows\SysWOW64\cmd.exe)
+//   - 通过 ToolHelp32 快照获取 kernel32.dll 的 32 位基址
+//   - 通过 ReadProcessMemory 读取 PE 导出表，解析 LoadLibraryW 的 RVA
+//   - 实际地址 = 基址 + RVA
+//   - 同一启动会话内，所有 32 位进程的 kernel32 加载地址相同（ASLR per-boot）
+// ============================================================================
+
+// PE 导出目录定义（使用 winnt.h 中的 IMAGE_EXPORT_DIRECTORY）
+// winnt.h 已通过 windows.h 包含
+
+uint32_t GetWow64LoadLibraryW() {
+    if (g_wow64LoadLibraryW_resolved) {
+        return g_wow64LoadLibraryW;
+    }
+    g_wow64LoadLibraryW_resolved = true; // only try once
+
+    // 1. 创建 32 位辅助进程
+    std::wstring helperExe = L"C:\\Windows\\SysWOW64\\cmd.exe";
+    std::wstring helperCmd = L"cmd.exe /c exit";
+
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {};
+
+    if (!CreateProcessW(helperExe.c_str(), &helperCmd[0],
+                        nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        OutputDebugStringA("[sandbox_hook] GetWow64LoadLibraryW: CreateProcess(SysWOW64\\cmd) failed\n");
+        return 0;
+    }
+
+    // 等待进程初始化
+    WaitForSingleObject(pi.hProcess, 2000);
+    CloseHandle(pi.hThread);
+
+    // 2. ToolHelp 快照 — 获取 kernel32.dll 基址
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pi.dwProcessId);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        OutputDebugStringA("[sandbox_hook] GetWow64LoadLibraryW: CreateToolhelp32Snapshot failed\n");
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        return 0;
+    }
+
+    uint32_t k32base = 0;
+    MODULEENTRY32W me = { sizeof(me) };
+
+    if (Module32FirstW(hSnapshot, &me)) {
+        do {
+            if (_wcsicmp(me.szModule, L"kernel32.dll") == 0) {
+                k32base = (uint32_t)(uintptr_t)me.modBaseAddr;
+                break;
+            }
+        } while (Module32NextW(hSnapshot, &me));
+    }
+    CloseHandle(hSnapshot);
+
+    if (k32base == 0) {
+        OutputDebugStringA("[sandbox_hook] GetWow64LoadLibraryW: kernel32.dll not found\n");
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        return 0;
+    }
+
+    // 3. 读取 PE 导出表
+    // DOS header → e_lfanew → NT header → OptionalHeader.DataDirectory[0]
+    IMAGE_DOS_HEADER dosHdr;
+    SIZE_T bytesRead;
+    if (!ReadProcessMemory(pi.hProcess, (LPCVOID)(uintptr_t)k32base,
+                           &dosHdr, sizeof(dosHdr), &bytesRead) || dosHdr.e_magic != IMAGE_DOS_SIGNATURE) {
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        return 0;
+    }
+
+    // NT header (32-bit: IMAGE_NT_HEADERS32)
+    uint32_t ntOffset = k32base + dosHdr.e_lfanew;
+    IMAGE_NT_HEADERS32 ntHdr;
+    if (!ReadProcessMemory(pi.hProcess, (LPCVOID)(uintptr_t)ntOffset,
+                           &ntHdr, sizeof(ntHdr), &bytesRead) || ntHdr.Signature != IMAGE_NT_SIGNATURE) {
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        return 0;
+    }
+
+    uint32_t exportDirRVA = ntHdr.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    uint32_t exportDirSize = ntHdr.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+    if (exportDirRVA == 0 || exportDirSize == 0) {
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        return 0;
+    }
+
+    // 读取导出目录
+    uint32_t exportDirAddr = k32base + exportDirRVA;
+    IMAGE_EXPORT_DIRECTORY exportDir;
+    if (!ReadProcessMemory(pi.hProcess, (LPCVOID)(uintptr_t)exportDirAddr,
+                           &exportDir, sizeof(exportDir), &bytesRead)) {
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        return 0;
+    }
+
+    // 读取名称表、序号表、地址表
+    uint32_t namesAddr = k32base + exportDir.AddressOfNames;
+    uint32_t ordinalsAddr = k32base + exportDir.AddressOfNameOrdinals;
+    uint32_t funcsAddr = k32base + exportDir.AddressOfFunctions;
+
+    std::vector<uint32_t> names(exportDir.NumberOfNames);
+    std::vector<uint16_t> ordinals(exportDir.NumberOfNames);
+    std::vector<uint32_t> funcs(exportDir.NumberOfFunctions);
+
+    ReadProcessMemory(pi.hProcess, (LPCVOID)(uintptr_t)namesAddr,
+                      names.data(), names.size() * 4, &bytesRead);
+    ReadProcessMemory(pi.hProcess, (LPCVOID)(uintptr_t)ordinalsAddr,
+                      ordinals.data(), ordinals.size() * 2, &bytesRead);
+    ReadProcessMemory(pi.hProcess, (LPCVOID)(uintptr_t)funcsAddr,
+                      funcs.data(), funcs.size() * 4, &bytesRead);
+
+    // 4. 二分 / 线性搜索 "LoadLibraryW"
+    uint32_t llwRVA = 0;
+    for (uint32_t i = 0; i < exportDir.NumberOfNames; i++) {
+        char funcName[64] = {};
+        ReadProcessMemory(pi.hProcess, (LPCVOID)(uintptr_t)(k32base + names[i]),
+                          funcName, sizeof(funcName) - 1, &bytesRead);
+
+        if (strcmp(funcName, "LoadLibraryW") == 0) {
+            uint16_t ordinal = ordinals[i];
+            llwRVA = funcs[ordinal];
+            break;
+        }
+    }
+
+    // 清理辅助进程
+    TerminateProcess(pi.hProcess, 0);
+    CloseHandle(pi.hProcess);
+
+    if (llwRVA == 0) {
+        OutputDebugStringA("[sandbox_hook] GetWow64LoadLibraryW: LoadLibraryW not found in exports\n");
+        return 0;
+    }
+
+    g_wow64LoadLibraryW = k32base + llwRVA;
+
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg), "[sandbox_hook] WOW64 LoadLibraryW = 0x%08X\n", g_wow64LoadLibraryW);
+    OutputDebugStringA(dbg);
+
+    return g_wow64LoadLibraryW;
+}
+
+// ============================================================================
 // ★ 自注入引擎（关键路径！）
 // ============================================================================
 
 bool SelfInject(DWORD pid, HANDLE hProcess, HANDLE hThread) {
-    // 1. 获取当前 DLL 路径
-    std::wstring dllPath = GetCurrentDllPath();
-    if (dllPath.empty()) {
-        AuditLog(AuditEventType::Error, L"", L"self-inject: empty DLL path", 0, -1);
-        return false;
-    }
-
-    // 2. 如果需要，打开目标进程
+    // 1. 打开目标进程（如果需要）
     HANDLE hTarget = hProcess;
     bool needClose = false;
     if (!hTarget || hTarget == INVALID_HANDLE_VALUE) {
@@ -150,15 +343,23 @@ bool SelfInject(DWORD pid, HANDLE hProcess, HANDLE hThread) {
         needClose = true;
     }
 
-    // 3. 检测目标架构（选择正确的 DLL）
+    // 2. 检测目标架构 → 选择 DLL 路径
     BOOL isWow64 = FALSE;
     IsWow64Process(hTarget, &isWow64);
 
-    // 对于 WOW64 目标，需要使用 x86 DLL 路径
-    // 此处简化处理：通过检测自身架构来决定
-    // 实际生产环境需要从文件系统选择对应架构的 DLL
+    std::wstring dllPath = GetDllPathForArch(isWow64 != FALSE);
+    if (dllPath.empty()) {
+        AuditLog(AuditEventType::Error, L"", L"self-inject: no DLL path for arch", 0, -1);
+        if (needClose) CloseHandle(hTarget);
+        return false;
+    }
 
-    // 4. 在目标进程中分配内存
+    char dbg[256];
+    snprintf(dbg, sizeof(dbg), "[sandbox_hook] SelfInject: PID=%lu, WOW64=%d, DLL=%ls\n",
+             pid, isWow64, dllPath.c_str());
+    OutputDebugStringA(dbg);
+
+    // 3. 在目标进程中分配内存
     size_t dllBytes = (dllPath.length() + 1) * sizeof(wchar_t);
     void* remoteMem = VirtualAllocEx(hTarget, nullptr, dllBytes,
                                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -168,7 +369,7 @@ bool SelfInject(DWORD pid, HANDLE hProcess, HANDLE hThread) {
         return false;
     }
 
-    // 5. 写入 DLL 路径
+    // 4. 写入 DLL 路径
     SIZE_T written = 0;
     if (!WriteProcessMemory(hTarget, remoteMem, dllPath.c_str(), dllBytes, &written)) {
         AuditLog(AuditEventType::Error, L"", L"self-inject: WriteProcessMemory failed", 0, GetLastError());
@@ -177,25 +378,36 @@ bool SelfInject(DWORD pid, HANDLE hProcess, HANDLE hThread) {
         return false;
     }
 
-    // 6. 获取 LoadLibraryW
-    // ★ 对于 WOW64 目标，需要获取 32 位 kernel32 的 LoadLibraryW
-    //    这里简化：直接使用 kernel32!LoadLibraryW（x64 下对 x64 目标有效）
-    //    x86 目标需要额外处理（通过 ToolHelp 获取 32 位地址）
-    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-    if (!k32) {
-        VirtualFreeEx(hTarget, remoteMem, 0, MEM_RELEASE);
-        if (needClose) CloseHandle(hTarget);
-        return false;
+    // 5. 获取 LoadLibraryW 地址
+    // ★ WOW64 目标：使用 32 位 kernel32!LoadLibraryW 地址
+    //    x64 目标：使用 64 位 kernel32!LoadLibraryW 地址
+    LPTHREAD_START_ROUTINE pLoadLibraryW = nullptr;
+
+    if (isWow64) {
+        uint32_t llw32 = GetWow64LoadLibraryW();
+        if (llw32 == 0) {
+            AuditLog(AuditEventType::Error, L"", L"self-inject: GetWow64LoadLibraryW failed", 0, -1);
+            VirtualFreeEx(hTarget, remoteMem, 0, MEM_RELEASE);
+            if (needClose) CloseHandle(hTarget);
+            return false;
+        }
+        pLoadLibraryW = (LPTHREAD_START_ROUTINE)(uintptr_t)llw32;
+    } else {
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        if (!k32) {
+            VirtualFreeEx(hTarget, remoteMem, 0, MEM_RELEASE);
+            if (needClose) CloseHandle(hTarget);
+            return false;
+        }
+        pLoadLibraryW = (LPTHREAD_START_ROUTINE)GetProcAddress(k32, "LoadLibraryW");
+        if (!pLoadLibraryW) {
+            VirtualFreeEx(hTarget, remoteMem, 0, MEM_RELEASE);
+            if (needClose) CloseHandle(hTarget);
+            return false;
+        }
     }
 
-    auto* pLoadLibraryW = (LPTHREAD_START_ROUTINE)GetProcAddress(k32, "LoadLibraryW");
-    if (!pLoadLibraryW) {
-        VirtualFreeEx(hTarget, remoteMem, 0, MEM_RELEASE);
-        if (needClose) CloseHandle(hTarget);
-        return false;
-    }
-
-    // 7. 创建远程线程
+    // 6. 创建远程线程
     HANDLE hRemoteThread = CreateRemoteThread(hTarget, nullptr, 0,
                                                pLoadLibraryW, remoteMem, 0, nullptr);
     if (!hRemoteThread) {
@@ -205,18 +417,17 @@ bool SelfInject(DWORD pid, HANDLE hProcess, HANDLE hThread) {
         return false;
     }
 
-    // 8. 等待 LoadLibraryW 完成（最关键：必须在 ResumeThread 之前完成）
-    //    超时时间设为 5 秒（正常情况下 DLL 加载只需几毫秒）
+    // 7. 等待 LoadLibraryW 完成（必须在 ResumeThread 前完成）
     DWORD waitRet = WaitForSingleObject(hRemoteThread, 5000);
     CloseHandle(hRemoteThread);
 
-    // 9. 清理
+    // 8. 清理
     VirtualFreeEx(hTarget, remoteMem, 0, MEM_RELEASE);
     if (needClose) CloseHandle(hTarget);
 
     if (waitRet == WAIT_OBJECT_0) {
         AuditLog(AuditEventType::InjectComplete, std::to_wstring(pid),
-                 L"self-inject success", 0, 0);
+                 L"self-inject ok", isWow64 ? 0x86 : 0x64, 0);
         return true;
     }
 
@@ -503,29 +714,70 @@ static void InstallNtCreateUserProcessHook() {
 }
 
 static void InstallNtResumeThreadHook() {
-#if defined(_M_IX86) || defined(__i386__)
-    // x86: 跳过 NtResumeThread hook（DLL 卸载时内核态调用导致崩溃）
-    // 子进程的沙箱化由 Rust Host 直接注入完成
-    (void)Hook_NtResumeThread;
-    return;
-#else
     BYTE* target = FindFunction("ntdll.dll", "NtResumeThread");
     if (target) {
         auto* tramp = (BYTE*)DetourInstall(target, (BYTE*)Hook_NtResumeThread, "NtResumeThread");
         if (tramp) Real_NtResumeThread = (decltype(Real_NtResumeThread))tramp;
     }
-#endif
 }
 
 // ============================================================================
 // 公开 API
 // ============================================================================
 
+// ============================================================================
+// Hook 引擎公开 API
+// ============================================================================
+
+// VEH 前置声明
+static LONG CALLBACK SandboxVehHandler(PEXCEPTION_POINTERS ExceptionInfo);
+
 bool InitHookEngine() {
     InitializeCriticalSection(&g_track_cs);
     g_track_cs_initialized = true;
     g_tracked.reserve(64);
+
+    // ★ 注册 VEH（Vectored Exception Handler）作为安全网
+    // 在 DLL 卸载期间，如果内核在 trampoline 释放后仍调用 NtResumeThread，
+    // VEH 捕获 ACCESS_VIOLATION 并安全处理（跳过故障指令）
+    AddVectoredExceptionHandler(1, SandboxVehHandler);
+
     return true;
+}
+
+// ============================================================================
+// ★ VEH — 向量化异常处理器（x86 卸载崩溃安全网）
+//
+// 在 x86 上，进程退出时内核可能在线程清理中调用 NtResumeThread。
+// 如果此时 trampoline 已被释放，跳转到已释放内存会触发
+// STATUS_ACCESS_VIOLATION。VEH 检测并安全降级。
+// ============================================================================
+
+static LONG CALLBACK SandboxVehHandler(PEXCEPTION_POINTERS ExceptionInfo) {
+    PEXCEPTION_RECORD record = ExceptionInfo->ExceptionRecord;
+
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION &&
+        record->ExceptionCode != EXCEPTION_PRIV_INSTRUCTION) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // 检查故障地址是否在我们的跳板区域内
+    PVOID faultAddr = record->ExceptionAddress;
+    if (IsAddressInTrampoline(reinterpret_cast<const BYTE*>(faultAddr))) {
+        // 跳板已被释放，跳过故障指令继续执行
+        // 修改指令指针到安全位置
+#if defined(_M_IX86) || defined(__i386__)
+        // x86: 跳过 JMP 指令（5 字节 E9 xx xx xx xx）
+        ExceptionInfo->ContextRecord->Eip += 5;
+#else
+        // x64: 跳过 JMP 指令（14 字节 FF 25 ...）
+        ExceptionInfo->ContextRecord->Rip += 14;
+#endif
+        OutputDebugStringA("[sandbox_hook] VEH: caught trampoline access violation, skipping\n");
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 void InstallAllHooks() {
@@ -548,7 +800,16 @@ void InstallAllHooks() {
 }
 
 void UninstallAllHooks() {
+    // ★ 严格的卸载顺序（解决 x86 崩溃）：
+    // 1. 首先设置 detaching 标志 → Hook 函数立即返回 STATUS_ACCESS_DENIED
+    // 2. 短暂延迟 → 等待所有正在执行的 Hook 完成
+    // 3. 恢复 hook 字节 → 后续 NtResumeThread 走原始函数
+    // 4. 释放跳板内存
     g_dll_detaching.store(true);
+
+    // 让正在执行的 Hook 有时间完成（特别是 Hook_NtResumeThread）
+    Sleep(5);
+
     DetourUninstallAll();
 }
 

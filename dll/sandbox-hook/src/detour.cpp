@@ -16,8 +16,28 @@
 // ============================================================================
 static std::vector<DetourContext*> g_contexts;
 
+// 跳板内存区域追踪（VEH 使用）
+struct TrampolineRegion {
+    BYTE* base;
+    SIZE_T size;
+};
+static std::vector<TrampolineRegion> g_trampoline_regions;
+
 static void RegisterContext(DetourContext* ctx) {
     g_contexts.push_back(ctx);
+    if (ctx->trampoline) {
+        g_trampoline_regions.push_back({ctx->trampoline, (SIZE_T)(ctx->patch_size + JMP_SIZE)});
+    }
+}
+
+static void UnregisterContext(DetourContext* ctx) {
+    // 从跳板追踪中移除
+    for (auto it = g_trampoline_regions.begin(); it != g_trampoline_regions.end(); ++it) {
+        if (it->base == ctx->trampoline) {
+            g_trampoline_regions.erase(it);
+            break;
+        }
+    }
 }
 
 void DetourUninstallAll() {
@@ -27,6 +47,16 @@ void DetourUninstallAll() {
         }
     }
     g_contexts.clear();
+    g_trampoline_regions.clear();
+}
+
+bool IsAddressInTrampoline(const BYTE* addr) {
+    for (auto& region : g_trampoline_regions) {
+        if (addr >= region.base && addr < (region.base + region.size)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ============================================================================

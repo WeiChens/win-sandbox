@@ -16,6 +16,9 @@ static void InitializeSandbox() {
         return;
     }
 
+    // 1.5. ★ 缓存 DLL 路径（从环境变量读取 x64/x86 路径）
+    CacheDllPaths();
+
     // 2. 从共享内存加载配置
     std::string configJson = LoadConfigFromSharedMemory();
     if (!configJson.empty()) {

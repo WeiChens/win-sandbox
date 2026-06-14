@@ -94,8 +94,8 @@ fn invalid_handle() -> HANDLE { !0isize as HANDLE }
 pub fn create_and_inject(
     command: &str,
     args: &[String],
-    _dll_path_x64: &str,
-    _dll_path_x86: &str,
+    dll_path_x64: &str,
+    dll_path_x86: &str,
     config: &SandboxConfig,
     ipc: &IpcServer,
 ) -> Result<(HANDLE, u32), Box<dyn std::error::Error>> {
@@ -104,24 +104,33 @@ pub fn create_and_inject(
     let cmdline_wide: Vec<u16> = OsStr::new(&cmdline)
         .encode_wide().chain(std::iter::once(0)).collect();
 
-    // 设置环境变量
-    set_hook_env_vars(ipc, config);
-
-    // 查找 DLL
+    // 解析 DLL 路径（绝对路径化）
     let exe_dir = std::env::current_exe()?
         .parent().unwrap_or(std::path::Path::new("."))
         .to_path_buf();
-    let dll_x64 = exe_dir.join("target").join("dll").join("x64").join("sandbox_hook.dll");
-    let dll_x86 = exe_dir.join("target").join("dll").join("x86").join("sandbox_hook.dll");
 
-    let dll_path = if dll_x64.exists() {
-        dll_x64.to_string_lossy().to_string()
-    } else if dll_x86.exists() {
-        dll_x86.to_string_lossy().to_string()
-    } else {
-        // 尝试从源码目录找
-        find_dll()?
+    let resolve_dll = |path: &str| -> String {
+        let p = std::path::Path::new(path);
+        if p.is_absolute() && p.exists() {
+            return path.to_string();
+        }
+        // 尝试相对于 exe 目录
+        let abs = exe_dir.join(path);
+        if abs.exists() {
+            return abs.to_string_lossy().to_string();
+        }
+        // 返回原始路径（让 DLL 端自行处理）
+        path.to_string()
     };
+
+    let dll_x64 = resolve_dll(dll_path_x64);
+    let dll_x86 = resolve_dll(dll_path_x86);
+
+    log::info!("DLL x64: {}", dll_x64);
+    log::info!("DLL x86: {}", dll_x86);
+
+    // 设置环境变量（传入 DLL 路径给子进程的 sandbox_hook.dll）
+    set_hook_env_vars(ipc, config, &dll_x64, &dll_x86);
 
     // 创建进程（挂起）
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
@@ -150,11 +159,10 @@ pub fn create_and_inject(
 
     // 检测架构
     let is_wow64 = is_process_wow64(pi.hProcess)?;
-    let dll_x86_str = dll_x86.to_string_lossy().to_string();
     let actual_dll: &str = if is_wow64 {
-        &dll_x86_str
+        &dll_x86
     } else {
-        &dll_path
+        &dll_x64
     };
 
     log::info!("架构: {}, DLL: {}", if is_wow64 { "x86" } else { "x64" }, actual_dll);
@@ -265,7 +273,7 @@ fn build_cmdline(command: &str, args: &[String]) -> String {
     cmd
 }
 
-fn set_hook_env_vars(ipc: &IpcServer, config: &SandboxConfig) {
+fn set_hook_env_vars(ipc: &IpcServer, config: &SandboxConfig, dll_x64: &str, dll_x86: &str) {
     let set_env = |key: &str, val: &str| unsafe {
         let k: Vec<u16> = OsStr::new(key).encode_wide().chain(std::iter::once(0)).collect();
         let v: Vec<u16> = OsStr::new(val).encode_wide().chain(std::iter::once(0)).collect();
@@ -277,6 +285,8 @@ fn set_hook_env_vars(ipc: &IpcServer, config: &SandboxConfig) {
     set_env("SBOX_RECURSIVE_INJECTION", if config.enable_recursive_injection { "1" } else { "0" });
     set_env("SBOX_NETWORK_ISOLATION", if config.enable_network_isolation { "1" } else { "0" });
     set_env("SBOX_AUDIT_DIR", &config.audit_log_dir.to_string_lossy());
+    set_env("SBOX_DLL_PATH_X64", dll_x64);
+    set_env("SBOX_DLL_PATH_X86", dll_x86);
 
     log::info!("沙箱环境变量已设置");
 }
