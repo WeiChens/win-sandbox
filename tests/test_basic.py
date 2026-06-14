@@ -67,10 +67,11 @@ def test_cmd_exit_code(runner: SandboxRunner) -> TestResult:
     t0 = time.time()
     rc, out, err = runner.exec("exit /b 42", config=BASIC_CONFIG, timeout=15)
     dt = time.time() - t0
+    # sandbox-host 自身返回 0，子进程退出码在 stdout 中 "exit_code=42"
     return runner.make_result(
         "cmd 退出码传递", "基础功能", "x64",
         rc, out, err,
-        expected_rc=42,
+        expected_text="exit_code=42",
         duration=dt,
     )
 
@@ -96,8 +97,9 @@ def test_cmd_stderr(runner: SandboxRunner) -> TestResult:
 def test_cmd_recursive_env(runner: SandboxRunner) -> TestResult:
     """1.6 环境变量传递"""
     t0 = time.time()
+    # 使用 cmd /v:on 延迟扩展 + !VAR! 语法
     rc, out, err = runner.exec(
-        "set TEST_VAR=hello_sandbox && echo %TEST_VAR%",
+        'cmd.exe /v:on /c "set TEST_VAR=hello_sandbox && echo !TEST_VAR!"',
         config=BASIC_CONFIG, timeout=15,
     )
     dt = time.time() - t0

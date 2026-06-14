@@ -54,7 +54,7 @@ pub fn run_sandbox(
     command: String,
     cmd_args: Vec<String>,
     config_path: Option<PathBuf>,
-    _timeout: Option<u64>,
+    timeout_param: Option<u64>,
 ) -> Result<SandboxResult, Box<dyn std::error::Error>> {
     let sandbox_config = config::load_config(config_path)?;
     log::info!("沙箱: {}", sandbox_config.name);
@@ -80,12 +80,31 @@ pub fn run_sandbox(
 
     log::info!("PID={} 已启动", process_id);
 
-    // 读取管道输出
-    let stdout = inject::read_pipe_to_end(stdout_reader.0);
-    let stderr = inject::read_pipe_to_end(stderr_reader.0);
+    // ★ 使用线程读取管道（防止阻塞）
+    // HANDLE (*mut c_void) 不可 Send，用 usize 传递句柄值
+    let stdout_h = stdout_reader.0 as usize;
+    let stderr_h = stderr_reader.0 as usize;
 
-    let exit_code = inject::wait_for_process(process_handle, process_id)?;
+    let stdout_thread = std::thread::spawn(move || {
+        inject::read_pipe_to_end(stdout_h as *mut std::ffi::c_void)
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        inject::read_pipe_to_end(stderr_h as *mut std::ffi::c_void)
+    });
+
+    // 等待进程退出（带超时）
+    let timeout_ms = timeout_param.unwrap_or(0).max(1) * 1000;
+    let exit_code = if timeout_ms > 0 {
+        inject::wait_for_process_timeout(process_handle, process_id, timeout_ms as u32)?
+    } else {
+        inject::wait_for_process(process_handle, process_id)?
+    };
+
     log::info!("PID={} 退出: {}", process_id, exit_code);
+
+    // 收集管道输出
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
 
     ipc_server.flush_audit();
     let audit_summary = ipc_server.summary();

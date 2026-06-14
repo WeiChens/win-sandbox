@@ -211,6 +211,7 @@ class SandboxRunner:
             str(HOST_EXE),
             "exec",
             "--config", str(config),
+            "--timeout", str(timeout),
             "--",
             shell, "/c", command,
         ]
@@ -255,6 +256,7 @@ class SandboxRunner:
             str(HOST_EXE),
             "exec",
             "--config", str(config),
+            "--timeout", str(timeout),
             "--",
             exe,
         ]

@@ -66,6 +66,7 @@ extern "system" {
     fn GetLastError() -> DWORD;
     fn WaitForSingleObject(hHandle: HANDLE, dwMs: DWORD) -> DWORD;
     fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
+    fn TerminateProcess(hProcess: HANDLE, uExitCode: DWORD) -> BOOL;
 
     fn VirtualAllocEx(hProcess: HANDLE, lpAddr: *const c_void, dwSize: usize,
                       flAllocType: DWORD, flProtect: DWORD) -> *mut c_void;
@@ -332,6 +333,28 @@ pub fn wait_for_process(process: HANDLE, _pid: u32) -> Result<u32, Box<dyn std::
         WaitForSingleObject(process, INFINITE);
         let mut exit_code: DWORD = 0;
         GetExitCodeProcess(process, &mut exit_code);
+        CloseHandle(process);
+        Ok(exit_code)
+    }
+}
+
+/// 等待进程退出，超时则强制终止
+pub fn wait_for_process_timeout(process: HANDLE, pid: u32, timeout_ms: u32) -> Result<u32, Box<dyn std::error::Error>> {
+    unsafe {
+        let ret = WaitForSingleObject(process, timeout_ms);
+        let exit_code = if ret == WAIT_OBJECT_0 {
+            let mut code: DWORD = 0;
+            GetExitCodeProcess(process, &mut code);
+            code
+        } else {
+            // 超时 → 强制终止
+            log::warn!("PID={} 超时 ({}ms)，强制终止", pid, timeout_ms);
+            TerminateProcess(process, 1);
+            WaitForSingleObject(process, 3000); // 等待终止完成
+            let mut code: DWORD = 0;
+            GetExitCodeProcess(process, &mut code);
+            code
+        };
         CloseHandle(process);
         Ok(exit_code)
     }

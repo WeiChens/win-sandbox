@@ -63,32 +63,54 @@ pub struct IpcServer {
     audit_buffer: Mutex<Vec<AuditEvent>>,
 }
 
+/// 创建共享内存，Global\ 失败时自动回退到 Local\（无需管理员权限）
+fn create_shm_global_fallback(name: &str, size: DWORD) -> Result<(HANDLE, *mut u8, String), String> {
+    // 先尝试 Global\（跨会话，需要管理员）
+    let global_name = format!("Global\\{}", name);
+    let mut last_err = 0u32;
+
+    let attempts: [(&str, &str); 2] = [("Global", &global_name), ("Local", name)];
+    for (attempt, prefix_name) in &attempts {
+        let name_wide: Vec<u16> = OsStr::new(prefix_name)
+            .encode_wide().chain(std::iter::once(0)).collect();
+
+        let handle = unsafe {
+            CreateFileMappingW(invalid_handle(), std::ptr::null(),
+                PAGE_READWRITE, 0, size, name_wide.as_ptr())
+        };
+
+        if !handle.is_null() && handle != invalid_handle() {
+            let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, size as usize) };
+            if !view.is_null() {
+                let ptr = view as *mut u8;
+                log::info!("共享内存已创建 ({}) : {}", attempt, prefix_name);
+                return Ok((handle, ptr, prefix_name.to_string()));
+            }
+            unsafe { CloseHandle(handle); }
+            return Err(format!("MapViewOfFile 失败: {}", unsafe { GetLastError() }));
+        }
+
+        last_err = unsafe { GetLastError() };
+        if *attempt == "Global" && last_err == 5 {
+            // ACCESS_DENIED → 回退到 Local\
+            log::warn!("Global\\ 需要管理员权限，回退到 Local\\ 命名空间");
+            continue;
+        }
+        return Err(format!("CreateFileMappingW({}) 失败: {}", attempt, last_err));
+    }
+
+    Err(format!("CreateFileMappingW 失败: {}", last_err))
+}
+
 impl IpcServer {
     pub fn new(host_pid: u32, config: &SandboxConfig) -> Result<Self, Box<dyn std::error::Error>> {
         // ================================================================
         // 1. 配置共享内存
         // ================================================================
-        let shm_name = format!("Global\\SBoxCfg_{}", host_pid);
-        log::info!("创建配置共享内存: {}", shm_name);
-
-        let name_wide: Vec<u16> = OsStr::new(&shm_name)
-            .encode_wide().chain(std::iter::once(0)).collect();
-
-        let shm_handle = unsafe {
-            CreateFileMappingW(invalid_handle(), std::ptr::null(),
-                PAGE_READWRITE, 0, SHM_MAX_SIZE as DWORD, name_wide.as_ptr())
-        };
-        if shm_handle.is_null() || shm_handle == invalid_handle() {
-            return Err(format!("CreateFileMappingW(配置) 失败: {}", unsafe { GetLastError() }).into());
-        }
-
-        let shm_view = unsafe {
-            MapViewOfFile(shm_handle, FILE_MAP_ALL_ACCESS, 0, 0, SHM_MAX_SIZE)
-        };
-        if shm_view.is_null() {
-            unsafe { CloseHandle(shm_handle); }
-            return Err(format!("MapViewOfFile(配置) 失败: {}", unsafe { GetLastError() }).into());
-        }
+        let cfg_base_name = format!("SBoxCfg_{}", host_pid);
+        let (shm_handle, shm_view, shm_name) = create_shm_global_fallback(
+            &cfg_base_name, SHM_MAX_SIZE as DWORD,
+        )?;
 
         // 写入配置 JSON
         let config_json = serde_json::to_vec(config)?;
@@ -114,29 +136,15 @@ impl IpcServer {
         // ================================================================
         // 2. 审计 Ring Buffer 共享内存
         // ================================================================
-        let audit_shm_name = format!("Global\\SBoxAudit_{}", host_pid);
-        log::info!("创建审计 Ring Buffer: {}", audit_shm_name);
-
-        let audit_name_wide: Vec<u16> = OsStr::new(&audit_shm_name)
-            .encode_wide().chain(std::iter::once(0)).collect();
-
+        let audit_base_name = format!("SBoxAudit_{}", host_pid);
         let total_size = audit_shm_size();
-        let audit_shm_handle = unsafe {
-            CreateFileMappingW(invalid_handle(), std::ptr::null(),
-                PAGE_READWRITE, 0, total_size as DWORD, audit_name_wide.as_ptr())
-        };
-        if audit_shm_handle.is_null() || audit_shm_handle == invalid_handle() {
-            unsafe { UnmapViewOfFile(shm_view as *const _); CloseHandle(shm_handle); }
-            return Err(format!("CreateFileMappingW(审计) 失败: {}", unsafe { GetLastError() }).into());
-        }
 
-        let audit_shm_view = unsafe {
-            MapViewOfFile(audit_shm_handle, FILE_MAP_ALL_ACCESS, 0, 0, total_size)
-        };
-        if audit_shm_view.is_null() {
-            unsafe { CloseHandle(audit_shm_handle); UnmapViewOfFile(shm_view as *const _); CloseHandle(shm_handle); }
-            return Err(format!("MapViewOfFile(审计) 失败: {}", unsafe { GetLastError() }).into());
-        }
+        let (audit_shm_handle, audit_shm_view, audit_shm_name) = create_shm_global_fallback(
+            &audit_base_name, total_size as DWORD,
+        ).map_err(|e| {
+            unsafe { UnmapViewOfFile(shm_view as *const _); CloseHandle(shm_handle); }
+            e
+        })?;
 
         // 初始化 Ring Buffer 头部
         let audit_header = audit_shm_view as *mut AuditRingHeader;
