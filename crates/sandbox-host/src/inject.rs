@@ -40,7 +40,7 @@ struct STARTUPINFOW {
     cb: DWORD,
     _pad0: *mut u16, _pad1: *mut u16, _pad2: *mut u16,
     _pad3: DWORD, _pad4: DWORD, _pad5: DWORD, _pad6: DWORD,
-    _pad7: DWORD, _pad8: DWORD, _pad9: DWORD,
+    _pad7: DWORD, dwFlags: DWORD, _pad9: DWORD,
     wShowWindow: u16, _pad10: u16,
     _pad11: *mut u8,
     hStdInput: HANDLE, hStdOutput: HANDLE, hStdError: HANDLE,
@@ -83,9 +83,65 @@ extern "system" {
     fn IsWow64Process(hProcess: HANDLE, Wow64Process: *mut BOOL) -> BOOL;
 
     fn SetEnvironmentVariableW(lpName: *const u16, lpValue: *const u16) -> BOOL;
+
+    // 管道
+    fn CreatePipe(hRead: *mut HANDLE, hWrite: *mut HANDLE,
+                  lpAttr: *const c_void, nSize: DWORD) -> BOOL;
+    fn ReadFile(hFile: HANDLE, lpBuf: *mut u8, nToRead: DWORD,
+                nRead: *mut DWORD, lpOverlapped: *mut c_void) -> BOOL;
+    fn PeekNamedPipe(hPipe: HANDLE, lpBuf: *mut u8, nBufSize: DWORD,
+                     nRead: *mut DWORD, nAvail: *mut DWORD, nLeft: *mut DWORD) -> BOOL;
 }
 
+const STARTF_USESTDHANDLES: DWORD = 0x0000_0100;
+
 fn invalid_handle() -> HANDLE { !0isize as HANDLE }
+
+// ============================================================================
+// 管道辅助函数
+// ============================================================================
+
+/// 创建一对管道 (读端, 写端) 用于捕获子进程输出
+pub fn create_pipe_pair() -> Result<((HANDLE, HANDLE), (HANDLE, HANDLE)), Box<dyn std::error::Error>> {
+    let mut stdout_read: HANDLE = std::ptr::null_mut();
+    let mut stdout_write: HANDLE = std::ptr::null_mut();
+    let mut stderr_read: HANDLE = std::ptr::null_mut();
+    let mut stderr_write: HANDLE = std::ptr::null_mut();
+
+    unsafe {
+        if CreatePipe(&mut stdout_read, &mut stdout_write, std::ptr::null(), 0) == 0 {
+            return Err(format!("CreatePipe(stdout) 失败: {}", GetLastError()).into());
+        }
+        if CreatePipe(&mut stderr_read, &mut stderr_write, std::ptr::null(), 0) == 0 {
+            CloseHandle(stdout_read); CloseHandle(stdout_write);
+            return Err(format!("CreatePipe(stderr) 失败: {}", GetLastError()).into());
+        }
+    }
+
+    // 返回：(读端对, 写端对)
+    // 读端给 Host 读取；(写端对)传给子进程
+    Ok(((stdout_read, stderr_read), (stdout_write, stderr_write)))
+}
+
+/// 从管道读取所有数据直到 EOF
+pub fn read_pipe_to_end(hPipe: HANDLE) -> String {
+    let mut result = Vec::new();
+    let mut buf = vec![0u8; 4096];
+
+    loop {
+        let mut nread: DWORD = 0;
+        let ret = unsafe {
+            ReadFile(hPipe, buf.as_mut_ptr(), buf.len() as DWORD, &mut nread, std::ptr::null_mut())
+        };
+        if ret == 0 || nread == 0 {
+            break;
+        }
+        result.extend_from_slice(&buf[..nread as usize]);
+    }
+
+    unsafe { CloseHandle(hPipe); }
+    String::from_utf8_lossy(&result).to_string()
+}
 
 // ============================================================================
 // 创建并注入
@@ -98,6 +154,7 @@ pub fn create_and_inject(
     dll_path_x86: &str,
     config: &SandboxConfig,
     ipc: &IpcServer,
+    pipes: Option<(HANDLE, HANDLE)>,  // (stdout_write, stderr_write)
 ) -> Result<(HANDLE, u32), Box<dyn std::error::Error>> {
     // 构建命令行
     let cmdline = build_cmdline(command, args);
@@ -136,6 +193,14 @@ pub fn create_and_inject(
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as DWORD;
 
+    // 设置管道句柄
+    if let Some((stdout_write, stderr_write)) = pipes {
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = stdout_write;
+        si.hStdError = stderr_write;
+        si.hStdInput = std::ptr::null_mut();
+    }
+
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
     let result = unsafe {
@@ -153,6 +218,14 @@ pub fn create_and_inject(
     if result == 0 {
         let err = unsafe { GetLastError() };
         return Err(format!("CreateProcessW 失败: {}", err).into());
+    }
+
+    // 关闭写端（子进程已继承）
+    if let Some((stdout_write, stderr_write)) = pipes {
+        unsafe {
+            CloseHandle(stdout_write);
+            CloseHandle(stderr_write);
+        }
     }
 
     log::info!("进程已创建 (SUSPENDED): PID={}", pi.dwProcessId);
@@ -287,6 +360,7 @@ fn set_hook_env_vars(ipc: &IpcServer, config: &SandboxConfig, dll_x64: &str, dll
     set_env("SBOX_AUDIT_DIR", &config.audit_log_dir.to_string_lossy());
     set_env("SBOX_DLL_PATH_X64", dll_x64);
     set_env("SBOX_DLL_PATH_X86", dll_x86);
+    set_env("SBOX_AUDIT_SHM", ipc.audit_shm_name());  // ★ Ring Buffer 名称
 
     log::info!("沙箱环境变量已设置");
 }

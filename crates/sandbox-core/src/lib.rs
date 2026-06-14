@@ -13,6 +13,7 @@ pub mod ipc;
 
 pub use acl::{FilePermission, FileRule, NetRule, NetAction, NetProtocol};
 pub use config::SandboxConfig;
-pub use ipc::{IpcHeader, AuditEvent, AuditEventType, SharedMemLayout, SHM_MAGIC, SHM_VERSION, SHM_MAX_SIZE};
+pub use ipc::{IpcHeader, AuditEvent, AuditEventType, SharedMemLayout, SHM_MAGIC, SHM_VERSION, SHM_MAX_SIZE,
+    AuditEventC, AuditRingHeader, AUDIT_EVENT_MAX_PATH, AUDIT_RING_SLOTS, AUDIT_RING_MAGIC, AUDIT_RING_VERSION};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

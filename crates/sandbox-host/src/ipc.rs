@@ -1,9 +1,16 @@
 //! IPC 服务模块 — 宿主端共享内存管理
 //!
-//! Host → 共享内存(配置) → C++ DLL
+//! 两个共享内存区域：
+//!   1. 配置 SHM:  Host → DLL (ACL规则)
+//!   2. 审计 Ring Buffer: DLL → Host (审计事件)
 
 use sandbox_core::SandboxConfig;
-use sandbox_core::ipc::{SharedMemLayout, AuditEvent, SHM_MAGIC, SHM_VERSION, SHM_MAX_SIZE};
+use sandbox_core::ipc::{
+    SharedMemLayout, AuditEvent, AuditEventC, AuditRingHeader,
+    AuditEventType, SHM_MAGIC, SHM_VERSION, SHM_MAX_SIZE,
+    AUDIT_RING_SLOTS, AUDIT_RING_MAGIC, AUDIT_RING_VERSION,
+    AUDIT_EVENT_MAX_PATH,
+};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::Mutex;
@@ -15,6 +22,7 @@ type BOOL = i32;
 
 const PAGE_READWRITE: DWORD = 0x04;
 const FILE_MAP_ALL_ACCESS: DWORD = 0xF001F;
+const FILE_MAP_READ: DWORD = 0x0004;
 
 extern "system" {
     fn CreateFileMappingW(hFile: HANDLE, lpAttr: *const c_void, flProtect: DWORD,
@@ -28,57 +36,72 @@ extern "system" {
 
 fn invalid_handle() -> HANDLE { !0isize as HANDLE }
 
+/// 计算 Ring Buffer 共享内存总大小
+fn audit_shm_size() -> usize {
+    std::mem::size_of::<AuditRingHeader>() + AUDIT_RING_SLOTS * std::mem::size_of::<AuditEventC>()
+}
+
 pub struct IpcServer {
+    /// Host PID
+    host_pid: u32,
+    /// 配置共享内存名称
     shm_name: String,
     shm_handle: HANDLE,
     shm_view: *mut u8,
+
+    /// 审计 Ring Buffer
+    audit_shm_name: String,
+    audit_shm_handle: HANDLE,
+    audit_shm_view: *mut u8,
+    audit_header: *mut AuditRingHeader,
+    audit_slots: *mut AuditEventC,
+
+    /// 上次读取位置
+    audit_read_pos: Mutex<u32>,
+
+    /// 收集的审计事件
     audit_buffer: Mutex<Vec<AuditEvent>>,
 }
 
 impl IpcServer {
     pub fn new(host_pid: u32, config: &SandboxConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        // ================================================================
+        // 1. 配置共享内存
+        // ================================================================
         let shm_name = format!("Global\\SBoxCfg_{}", host_pid);
-        log::info!("创建共享内存: {}", shm_name);
+        log::info!("创建配置共享内存: {}", shm_name);
 
         let name_wide: Vec<u16> = OsStr::new(&shm_name)
             .encode_wide().chain(std::iter::once(0)).collect();
 
         let shm_handle = unsafe {
-            CreateFileMappingW(
-                invalid_handle(), std::ptr::null(),
-                PAGE_READWRITE, 0, SHM_MAX_SIZE as DWORD,
-                name_wide.as_ptr(),
-            )
+            CreateFileMappingW(invalid_handle(), std::ptr::null(),
+                PAGE_READWRITE, 0, SHM_MAX_SIZE as DWORD, name_wide.as_ptr())
         };
-
         if shm_handle.is_null() || shm_handle == invalid_handle() {
-            return Err(format!("CreateFileMappingW 失败: {}", unsafe { GetLastError() }).into());
+            return Err(format!("CreateFileMappingW(配置) 失败: {}", unsafe { GetLastError() }).into());
         }
 
         let shm_view = unsafe {
             MapViewOfFile(shm_handle, FILE_MAP_ALL_ACCESS, 0, 0, SHM_MAX_SIZE)
         };
-
         if shm_view.is_null() {
             unsafe { CloseHandle(shm_handle); }
-            return Err(format!("MapViewOfFile 失败: {}", unsafe { GetLastError() }).into());
+            return Err(format!("MapViewOfFile(配置) 失败: {}", unsafe { GetLastError() }).into());
         }
 
-        // 写入配置
+        // 写入配置 JSON
         let config_json = serde_json::to_vec(config)?;
-
         unsafe {
             let hdr = shm_view as *mut SharedMemLayout;
             std::ptr::write(hdr, SharedMemLayout {
-                magic: SHM_MAGIC,
-                version: SHM_VERSION,
+                magic: SHM_MAGIC, version: SHM_VERSION,
                 file_rule_count: config.file_permissions.len() as u32,
                 net_rule_count: config.network_permissions.len() as u32,
                 audit_event_name: [0u16; 64],
                 data_size: config_json.len() as u32,
                 _reserved: [0u8; 64],
             });
-
             let hdr_size = std::mem::size_of::<SharedMemLayout>();
             std::ptr::copy_nonoverlapping(
                 config_json.as_ptr(),
@@ -86,18 +109,129 @@ impl IpcServer {
                 config_json.len(),
             );
         }
+        log::info!("配置共享内存已写入: {} 字节", config_json.len());
 
-        log::info!("共享内存已写入: {} 字节", config_json.len());
+        // ================================================================
+        // 2. 审计 Ring Buffer 共享内存
+        // ================================================================
+        let audit_shm_name = format!("Global\\SBoxAudit_{}", host_pid);
+        log::info!("创建审计 Ring Buffer: {}", audit_shm_name);
+
+        let audit_name_wide: Vec<u16> = OsStr::new(&audit_shm_name)
+            .encode_wide().chain(std::iter::once(0)).collect();
+
+        let total_size = audit_shm_size();
+        let audit_shm_handle = unsafe {
+            CreateFileMappingW(invalid_handle(), std::ptr::null(),
+                PAGE_READWRITE, 0, total_size as DWORD, audit_name_wide.as_ptr())
+        };
+        if audit_shm_handle.is_null() || audit_shm_handle == invalid_handle() {
+            unsafe { UnmapViewOfFile(shm_view as *const _); CloseHandle(shm_handle); }
+            return Err(format!("CreateFileMappingW(审计) 失败: {}", unsafe { GetLastError() }).into());
+        }
+
+        let audit_shm_view = unsafe {
+            MapViewOfFile(audit_shm_handle, FILE_MAP_ALL_ACCESS, 0, 0, total_size)
+        };
+        if audit_shm_view.is_null() {
+            unsafe { CloseHandle(audit_shm_handle); UnmapViewOfFile(shm_view as *const _); CloseHandle(shm_handle); }
+            return Err(format!("MapViewOfFile(审计) 失败: {}", unsafe { GetLastError() }).into());
+        }
+
+        // 初始化 Ring Buffer 头部
+        let audit_header = audit_shm_view as *mut AuditRingHeader;
+        let audit_slots = unsafe {
+            (audit_shm_view as *mut u8).add(std::mem::size_of::<AuditRingHeader>()) as *mut AuditEventC
+        };
+
+        unsafe {
+            std::ptr::write(audit_header, AuditRingHeader {
+                magic: AUDIT_RING_MAGIC,
+                version: AUDIT_RING_VERSION,
+                write_cursor: 0,
+                read_cursor: 0,
+                slot_count: AUDIT_RING_SLOTS as u32,
+                slot_size: std::mem::size_of::<AuditEventC>() as u32,
+                overflow_count: 0,
+                _reserved: [0u8; 36],
+            });
+        }
+        log::info!("审计 Ring Buffer 已初始化: {} 槽位 × {} bytes = {} KB",
+            AUDIT_RING_SLOTS, std::mem::size_of::<AuditEventC>(), total_size / 1024);
 
         Ok(Self {
+            host_pid,
             shm_name,
             shm_handle,
             shm_view: shm_view as *mut u8,
+            audit_shm_name,
+            audit_shm_handle,
+            audit_shm_view: audit_shm_view as *mut u8,
+            audit_header,
+            audit_slots,
+            audit_read_pos: Mutex::new(0),
             audit_buffer: Mutex::new(Vec::new()),
         })
     }
 
     pub fn shm_name(&self) -> &str { &self.shm_name }
+    pub fn audit_shm_name(&self) -> &str { &self.audit_shm_name }
+    pub fn host_pid(&self) -> u32 { self.host_pid }
+
+    /// 从 Ring Buffer 消费审计事件
+    pub fn poll_audit(&self) -> Vec<AuditEvent> {
+        let header = unsafe { &*self.audit_header };
+        let mut read_pos = self.audit_read_pos.lock().unwrap();
+
+        let write_pos = header.write_cursor;
+        let mut events = Vec::new();
+
+        while *read_pos < write_pos {
+            let slot_idx = (*read_pos % header.slot_count) as usize;
+            // ★ 使用 ptr::read_unaligned 安全读取共享内存中的槽位
+            let slot: AuditEventC = unsafe {
+                std::ptr::read_unaligned(self.audit_slots.add(slot_idx))
+            };
+
+            // 转换二进制事件 → Rust AuditEvent
+            let target_end = slot.target.iter().position(|&c| c == 0).unwrap_or(AUDIT_EVENT_MAX_PATH);
+            let detail_end = slot.detail.iter().position(|&c| c == 0).unwrap_or(128);
+            let target = String::from_utf16_lossy(&slot.target[..target_end]);
+            let detail = String::from_utf16_lossy(&slot.detail[..detail_end]);
+
+            let event_type = match slot.event_type {
+                0 => AuditEventType::FileAllow,
+                1 => AuditEventType::FileDeny,
+                2 => AuditEventType::FileDowngrade,
+                3 => AuditEventType::NetAllow,
+                4 => AuditEventType::NetDeny,
+                5 => AuditEventType::ProcessCreate,
+                6 => AuditEventType::InjectComplete,
+                _ => AuditEventType::Error,
+            };
+
+            events.push(AuditEvent {
+                event_type,
+                pid: slot.pid,
+                timestamp_ms: slot.timestamp_ms,
+                target,
+                detail,
+                access_mask: slot.access_mask,
+                nt_status: slot.nt_status,
+            });
+
+            *read_pos += 1;
+        }
+
+        // 更新 read_cursor（通知 DLL 可以复用槽位）
+        if *read_pos > header.read_cursor {
+            unsafe {
+                (*self.audit_header).read_cursor = *read_pos;
+            }
+        }
+
+        events
+    }
 
     pub fn record_audit(&self, event: AuditEvent) {
         if let Ok(mut buf) = self.audit_buffer.lock() {
@@ -105,32 +239,49 @@ impl IpcServer {
         }
     }
 
+    /// 刷出所有审计事件
     pub fn flush_audit(&self) {
+        let events = self.poll_audit();
+        if let Ok(mut buf) = self.audit_buffer.lock() {
+            buf.extend(events);
+        }
         if let Ok(buf) = self.audit_buffer.lock() {
-            log::debug!("审计: {} 条事件", buf.len());
+            log::info!("审计: {} 条事件", buf.len());
         }
     }
 
     pub fn summary(&self) -> String {
+        self.flush_audit();
         let buf = self.audit_buffer.lock().unwrap_or_else(|e| e.into_inner());
         let denied = buf.iter().filter(|e| matches!(e.event_type,
-            sandbox_core::ipc::AuditEventType::FileDeny |
-            sandbox_core::ipc::AuditEventType::NetDeny
+            AuditEventType::FileDeny | AuditEventType::NetDeny
         )).count();
-        format!("=== 审计摘要 ===\n总计: {}\n允许: {}\n拒绝: {}\n",
-            buf.len(), buf.len() - denied, denied)
+
+        let mut lines = vec![
+            format!("=== 沙箱审计摘要 ==="),
+            format!("总计: {}  允许: {}  拒绝: {}  溢出: {}",
+                buf.len(), buf.len() - denied, denied,
+                unsafe { (*self.audit_header).overflow_count }),
+        ];
+
+        // 最近 20 条
+        for evt in buf.iter().rev().take(20) {
+            lines.push(format!(
+                "  [{:?}] PID={} {} | {}",
+                evt.event_type, evt.pid, evt.target, evt.detail
+            ));
+        }
+        lines.join("\n")
     }
 }
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
         unsafe {
-            if !self.shm_view.is_null() {
-                UnmapViewOfFile(self.shm_view as *const _);
-            }
-            if !self.shm_handle.is_null() && self.shm_handle != invalid_handle() {
-                CloseHandle(self.shm_handle);
-            }
+            if !self.shm_view.is_null() { UnmapViewOfFile(self.shm_view as *const _); }
+            if !self.shm_handle.is_null() && self.shm_handle != invalid_handle() { CloseHandle(self.shm_handle); }
+            if !self.audit_shm_view.is_null() { UnmapViewOfFile(self.audit_shm_view as *const _); }
+            if !self.audit_shm_handle.is_null() && self.audit_shm_handle != invalid_handle() { CloseHandle(self.audit_shm_handle); }
         }
     }
 }

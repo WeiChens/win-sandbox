@@ -90,7 +90,7 @@ Rust Host 无法实时获取审计事件。
 - 创建第二个共享内存区域：`Global\SBoxAudit_<HostPID>`
 - 布局：无锁 ring buffer（单生产者 / 单消费者）
   ```
-  [header: write_cursor(4B)][slots: N × AuditEvent(128B)]
+  [header: write_cursor(4B)][slots: N × AuditEventC(800B)]
   ```
 - C++ DLL 端：`AuditLog()` 使用 `InterlockedIncrement` 获取写入位置，
   写入事件后更新 cursor（fire-and-forget，不阻塞 Hook）
@@ -102,7 +102,7 @@ Rust Host 无法实时获取审计事件。
 - `crates/sandbox-host/src/ipc.rs`（新增审计消费线程）
 - `crates/sandbox-core/src/ipc.rs`（定义 ring buffer 布局）
 
-**估时：** 5-6h
+**估时：** 5-6h  ✅ **已完成** (2024-06-14)
 
 ---
 
@@ -111,14 +111,14 @@ Rust Host 无法实时获取审计事件。
 **问题：** 当前 `AuditEvent` 只在 Rust 端定义（serde JSON），C++ 端用字符串拼接。
 
 **方案：**
-- 定义 `repr(C)` 的 `AuditEventC` 结构体（固定大小 128B），C++/Rust 共享布局
+- 定义 `repr(C)` 的 `AuditEventC` 结构体（固定大小 800B），C++/Rust 共享布局
 - C++ 端直接写二进制结构到 ring buffer
 - Rust 端从 ring buffer 读取二进制结构，转换为 `AuditEvent`（带时间戳格式化）
 - 不再使用 JSON 作为传输格式（减少序列化开销）
 
 **文件：** `crates/sandbox-core/src/ipc.rs`, `dll/sandbox-hook/include/ipc_client.h`
 
-**估时：** 3h
+**估时：** 3h  ✅ **已完成** (2024-06-14)
 
 ---
 
@@ -136,7 +136,7 @@ TRAE 有专门的 `CorExitProcess` Hook。
 
 **文件：** `dll/sandbox-hook/src/hook_engine.cpp`
 
-**估时：** 2h
+**估时：** 2h  ✅ 已完成
 
 ---
 

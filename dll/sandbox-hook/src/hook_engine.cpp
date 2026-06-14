@@ -780,6 +780,94 @@ static LONG CALLBACK SandboxVehHandler(PEXCEPTION_POINTERS ExceptionInfo) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// ============================================================================
+// ★ CorExitProcess Hook — 拦截 .NET CLR 进程退出
+//
+// .NET CLR 使用 mscoree!CorExitProcess 退出，可能绕过正常进程退出流程。
+// 我们 Hook 它以在退出前刷出审计日志、释放资源。
+// ============================================================================
+
+typedef void (STDMETHODCALLTYPE *PFN_CorExitProcess)(int exitCode);
+static PFN_CorExitProcess Real_CorExitProcess = nullptr;
+
+static void STDMETHODCALLTYPE Hook_CorExitProcess(int exitCode) {
+    // 在 CLR 退出前刷出审计
+    AuditLog(AuditEventType::ProcessCreate, L"", L"clr_exit_intercepted", exitCode, 0);
+
+    if (Real_CorExitProcess) {
+        Real_CorExitProcess(exitCode);
+    } else {
+        // 如果原始函数不可用，直接调用 TerminateProcess
+        TerminateProcess(GetCurrentProcess(), exitCode);
+    }
+}
+
+static void InstallCorExitProcessHook() {
+    HMODULE hMscoree = GetModuleHandleW(L"mscoree.dll");
+    if (!hMscoree) return; // CLR 未加载，跳过
+
+    BYTE* target = reinterpret_cast<BYTE*>(GetProcAddress(hMscoree, "CorExitProcess"));
+    if (!target) return;
+
+    auto* tramp = reinterpret_cast<BYTE*>(DetourInstall(target,
+        reinterpret_cast<BYTE*>(Hook_CorExitProcess), "CorExitProcess"));
+    if (tramp) {
+        Real_CorExitProcess = reinterpret_cast<PFN_CorExitProcess>(tramp);
+        OutputDebugStringA("[sandbox_hook] CorExitProcess hooked\n");
+    }
+}
+
+// ============================================================================
+// ★ SetUnhandledExceptionFilter Hook — 崩溃恢复
+//
+// 确保在进程崩溃前刷出审计缓冲。
+// 与 VEH 配合，形成双层防护：
+//   VEH (Layer 1): 捕获 trampoline 访问违规
+//   UEH (Layer 2): 捕获其他未处理异常，刷出审计
+// ============================================================================
+
+typedef LPTOP_LEVEL_EXCEPTION_FILTER (WINAPI *PFN_SetUnhandledExceptionFilter)(
+    LPTOP_LEVEL_EXCEPTION_FILTER lpTopLevelExceptionFilter);
+static PFN_SetUnhandledExceptionFilter Real_SetUnhandledExceptionFilter = nullptr;
+
+// 我们的异常过滤器 — 在崩溃前刷出审计缓冲
+static LONG WINAPI SandboxUefHandler(PEXCEPTION_POINTERS ExceptionInfo) {
+    // 尽力刷出审计（此时进程即将终止，任何操作都可能失败）
+    AuditLog(AuditEventType::Error, L"", L"unhandled_exception",
+             ExceptionInfo->ExceptionRecord->ExceptionCode, 0);
+
+    OutputDebugStringA("[sandbox_hook] Unhandled exception caught, audit flushed\n");
+
+    // 返回 EXCEPTION_CONTINUE_SEARCH → 传递给下一个处理器 / 触发 WER
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI Hook_SetUnhandledExceptionFilter(
+    LPTOP_LEVEL_EXCEPTION_FILTER lpTopLevelExceptionFilter) {
+    // 始终注册我们自己的处理器（不覆盖调用者的）
+    SetUnhandledExceptionFilter(SandboxUefHandler);
+
+    // 透传（调用者可能期望设置自己的处理器）
+    return Real_SetUnhandledExceptionFilter
+        ? Real_SetUnhandledExceptionFilter(lpTopLevelExceptionFilter)
+        : nullptr;
+}
+
+static void InstallCrashHandlerHook() {
+    BYTE* target = FindFunction("kernel32.dll", "SetUnhandledExceptionFilter");
+    if (!target) return;
+
+    auto* tramp = reinterpret_cast<BYTE*>(DetourInstall(target,
+        reinterpret_cast<BYTE*>(Hook_SetUnhandledExceptionFilter),
+        "SetUnhandledExceptionFilter"));
+    if (tramp) {
+        Real_SetUnhandledExceptionFilter = reinterpret_cast<PFN_SetUnhandledExceptionFilter>(tramp);
+        // 立即注册我们的异常处理器
+        SetUnhandledExceptionFilter(SandboxUefHandler);
+        OutputDebugStringA("[sandbox_hook] UnhandledExceptionFilter hooked\n");
+    }
+}
+
 void InstallAllHooks() {
     // 文件系统 Hook
     InstallNtCreateFileHook();
@@ -795,6 +883,10 @@ void InstallAllHooks() {
     if (GetEnvironmentVariableW(L"SBOX_NETWORK_ISOLATION", netEnv, 4) == 0 || netEnv[0] != L'0') {
         InstallNetHooks();
     }
+
+    // CLR + 崩溃恢复 Hook
+    InstallCorExitProcessHook();
+    InstallCrashHandlerHook();
 
     AuditLog(AuditEventType::ProcessCreate, L"", L"all_hooks_installed", 0, 0);
 }

@@ -118,6 +118,43 @@ pub struct IpcHeader {
 }
 
 // ============================================================================
+// 审计 Ring Buffer（DLL → Host，无锁单生产者单消费者）
+// ============================================================================
+
+/// 单个审计事件槽（固定大小，C++/Rust 共享布局）
+pub const AUDIT_EVENT_MAX_PATH: usize = 260;
+pub const AUDIT_RING_SLOTS: usize = 1024;
+
+/// 二进制审计事件（repr(C)，与 C++ AuditEventC 一致）
+#[repr(C)]
+pub struct AuditEventC {
+    pub event_type: u32,
+    pub pid: u32,
+    pub timestamp_ms: u32,
+    pub target: [u16; AUDIT_EVENT_MAX_PATH],
+    pub detail: [u16; 128],
+    pub access_mask: u32,
+    pub nt_status: i32,
+    pub _padding: u32,
+}
+
+/// Ring Buffer 头部
+#[repr(C)]
+pub struct AuditRingHeader {
+    pub magic: u32,           // 0x53424155 "SBAU"
+    pub version: u32,         // 1
+    pub write_cursor: u32,    // DLL 递增（volatile）
+    pub read_cursor: u32,     // Host 递增
+    pub slot_count: u32,      // AUDIT_RING_SLOTS
+    pub slot_size: u32,       // sizeof(AuditEventC)
+    pub overflow_count: u32,  // 溢出计数
+    pub _reserved: [u8; 36],
+}
+
+pub const AUDIT_RING_MAGIC: u32 = 0x53424155; // "SBAU"
+pub const AUDIT_RING_VERSION: u32 = 1;
+
+// ============================================================================
 // 测试
 // ============================================================================
 
@@ -163,5 +200,26 @@ mod tests {
         let restored: AuditEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.event_type, AuditEventType::FileDeny);
         assert_eq!(restored.pid, 12345);
+    }
+
+    #[test]
+    fn test_audit_event_c_size() {
+        // C++/Rust 布局一致性验证
+        let size = mem::size_of::<AuditEventC>();
+        // event_type(4) + pid(4) + timestamp_ms(4) + target(520) + detail(256)
+        // + access_mask(4) + nt_status(4) + _padding(4) = 800
+        assert_eq!(size, 800);
+    }
+
+    #[test]
+    fn test_audit_ring_header_size() {
+        let size = mem::size_of::<AuditRingHeader>();
+        // magic(4)+version(4)+write_cursor(4)+read_cursor(4)+slot_count(4)+slot_size(4)+overflow(4)+reserved(36)
+        assert_eq!(size, 64);
+    }
+
+    #[test]
+    fn test_audit_ring_magic() {
+        assert_eq!(AUDIT_RING_MAGIC, 0x53424155); // "SBAU"
     }
 }
