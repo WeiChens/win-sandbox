@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "crates/sandbox-core",
+    "crates/sandbox-host",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
