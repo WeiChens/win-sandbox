@@ -206,3 +206,179 @@ fn print_usage() {
   sandbox-host serve 9800
 "#);
 }
+
+// ============================================================================
+// 测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &[&str]) -> Vec<String> {
+        std::iter::once("sandbox-host.exe".to_string())
+            .chain(s.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_exec_basic() {
+        let a = args(&["exec", "cmd.exe", "/c", "dir"]);
+        let cli = parse_from(&a);
+        match cli.command {
+            Command::Exec { command, cmd_args, .. } => {
+                assert_eq!(command, "cmd.exe");
+                assert_eq!(cmd_args, vec!["/c", "dir"]);
+            }
+            _ => panic!("Expected Exec"),
+        }
+    }
+
+    #[test]
+    fn test_exec_with_config() {
+        let a = args(&["exec", "--config", "my.json", "python", "script.py"]);
+        let cli = parse_from(&a);
+        match cli.command {
+            Command::Exec { command, cmd_args, config_path, .. } => {
+                assert_eq!(command, "python");
+                assert_eq!(cmd_args, vec!["script.py"]);
+                assert!(config_path.is_some());
+            }
+            _ => panic!("Expected Exec"),
+        }
+    }
+
+    #[test]
+    fn test_exec_with_timeout() {
+        let a = args(&["exec", "--timeout", "30", "cmd.exe"]);
+        let cli = parse_from(&a);
+        match cli.command {
+            Command::Exec { command, timeout, .. } => {
+                assert_eq!(command, "cmd.exe");
+                assert_eq!(timeout, Some(30));
+            }
+            _ => panic!("Expected Exec"),
+        }
+    }
+
+    #[test]
+    fn test_exec_with_double_dash() {
+        let a = args(&["exec", "--config", "cfg.json", "--", "cmd.exe", "/c", "echo hello"]);
+        let cli = parse_from(&a);
+        match cli.command {
+            Command::Exec { command, cmd_args, config_path, .. } => {
+                assert_eq!(command, "cmd.exe");
+                assert_eq!(cmd_args, vec!["/c", "echo hello"]);
+                assert!(config_path.is_some());
+            }
+            _ => panic!("Expected Exec"),
+        }
+    }
+
+    #[test]
+    fn test_implicit_exec() {
+        let a = args(&["cmd.exe", "/c", "whoami"]);
+        let cli = parse_from(&a);
+        match cli.command {
+            Command::Exec { command, cmd_args, .. } => {
+                assert_eq!(command, "cmd.exe");
+                assert_eq!(cmd_args, vec!["/c", "whoami"]);
+            }
+            _ => panic!("Expected Exec (implicit)"),
+        }
+    }
+
+    #[test]
+    fn test_config_show() {
+        let a = args(&["config", "show"]);
+        let cli = parse_from(&a);
+        match cli.command {
+            Command::Config { action: ConfigAction::Show { path } } => {
+                assert!(path.is_none());
+            }
+            _ => panic!("Expected Config::Show"),
+        }
+    }
+
+    #[test]
+    fn test_config_init() {
+        let a = args(&["config", "init", "output.json"]);
+        let cli = parse_from(&a);
+        match cli.command {
+            Command::Config { action: ConfigAction::Init { output } } => {
+                assert_eq!(output, Some(PathBuf::from("output.json")));
+            }
+            _ => panic!("Expected Config::Init"),
+        }
+    }
+
+    #[test]
+    fn test_config_validate() {
+        let a = args(&["config", "validate", "sandbox.json"]);
+        let cli = parse_from(&a);
+        match cli.command {
+            Command::Config { action: ConfigAction::Validate { path } } => {
+                assert_eq!(path, PathBuf::from("sandbox.json"));
+            }
+            _ => panic!("Expected Config::Validate"),
+        }
+    }
+
+    #[test]
+    fn test_audit_text() {
+        let a = args(&["audit"]);
+        let cli = parse_from(&a);
+        match cli.command {
+            Command::Audit { format, .. } => {
+                assert!(matches!(format, AuditFormat::Text));
+            }
+            _ => panic!("Expected Audit"),
+        }
+    }
+
+    #[test]
+    fn test_audit_json() {
+        let a = args(&["audit", "--json"]);
+        let cli = parse_from(&a);
+        match cli.command {
+            Command::Audit { format, .. } => {
+                assert!(matches!(format, AuditFormat::Json));
+            }
+            _ => panic!("Expected Audit::Json"),
+        }
+    }
+
+    #[test]
+    fn test_serve_default_port() {
+        let a = args(&["serve"]);
+        let cli = parse_from(&a);
+        match cli.command {
+            Command::Serve { port } => assert_eq!(port, 9800),
+            _ => panic!("Expected Serve"),
+        }
+    }
+
+    #[test]
+    fn test_serve_custom_port() {
+        let a = args(&["serve", "3000"]);
+        let cli = parse_from(&a);
+        match cli.command {
+            Command::Serve { port } => assert_eq!(port, 3000),
+            _ => panic!("Expected Serve"),
+        }
+    }
+
+    #[test]
+    fn test_verbose_flag() {
+        let a = args(&["--verbose", "exec", "cmd.exe"]);
+        let cli = parse_from(&a);
+        assert!(cli.verbose);
+    }
+
+    #[test]
+    fn test_verbose_short_flag() {
+        let a = args(&["-v", "exec", "cmd.exe"]);
+        let cli = parse_from(&a);
+        assert!(cli.verbose);
+    }
+}

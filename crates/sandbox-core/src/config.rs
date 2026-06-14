@@ -153,6 +153,7 @@ mod tests {
         assert_eq!(config.name, "default-sandbox");
         assert!(config.enable_network_isolation);
         assert!(config.enable_recursive_injection);
+        assert_eq!(config.file_permissions.len(), 2);
     }
 
     #[test]
@@ -163,9 +164,86 @@ mod tests {
     }
 
     #[test]
+    fn test_strict_config_denies_all_files() {
+        let config = SandboxConfig::strict_config();
+        let last_rule = config.file_permissions.last().unwrap();
+        assert_eq!(last_rule.pattern, "*");
+        assert_eq!(last_rule.permission, crate::acl::FilePermission::Deny);
+    }
+
+    #[test]
     fn test_deserialize_minimal_config() {
         let json = r#"{"name": "test"}"#;
         let config: SandboxConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.name, "test");
+    }
+
+    #[test]
+    fn test_deserialize_full_config() {
+        let json = r#"{
+            "name": "full-test",
+            "file_permissions": [
+                {"pattern": "C:\\Users\\*\\**", "permission": "read_only"}
+            ],
+            "network_permissions": [
+                {"host": "127.0.0.1", "port": 8080, "protocol": "tcp", "action": "allow"}
+            ],
+            "enable_network_isolation": false,
+            "enable_recursive_injection": false,
+            "timeout_secs": 60
+        }"#;
+        let config: SandboxConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.name, "full-test");
+        assert!(!config.enable_network_isolation);
+        assert!(!config.enable_recursive_injection);
+        assert_eq!(config.timeout_secs, 60);
+        assert_eq!(config.file_permissions.len(), 1);
+        assert_eq!(config.network_permissions.len(), 1);
+    }
+
+    #[test]
+    fn test_deserialize_dev_config() {
+        let config = SandboxConfig::dev_config();
+        let dev_json = serde_json::to_string(&config).unwrap();
+        let restored: SandboxConfig = serde_json::from_str(&dev_json).unwrap();
+        assert_eq!(restored.name, config.name);
+        assert_eq!(restored.file_permissions.len(), config.file_permissions.len());
+    }
+
+    #[test]
+    fn test_config_defaults_on_missing_fields() {
+        // 空 JSON 对象应使用所有默认值
+        let json = r#"{}"#;
+        let config: SandboxConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.name, "default-sandbox");
+        assert_eq!(config.sandbox_root, PathBuf::from(".\\sandbox-workdir"));
+        assert!(config.enable_network_isolation);
+        assert_eq!(config.timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_timeout_serialization() {
+        let mut config = SandboxConfig::default();
+        config.timeout_secs = 300;
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("300"));
+        let restored: SandboxConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.timeout_secs, 300);
+    }
+
+    #[test]
+    fn test_file_rule_order_is_preserved() {
+        let json = r#"{
+            "name": "order-test",
+            "file_permissions": [
+                {"pattern": "first", "permission": "deny"},
+                {"pattern": "second", "permission": "read_only"},
+                {"pattern": "third", "permission": "inherit"}
+            ]
+        }"#;
+        let config: SandboxConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.file_permissions[0].pattern, "first");
+        assert_eq!(config.file_permissions[1].pattern, "second");
+        assert_eq!(config.file_permissions[2].pattern, "third");
     }
 }

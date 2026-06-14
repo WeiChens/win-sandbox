@@ -93,11 +93,24 @@ mod tests {
     }
 
     #[test]
+    fn test_file_permission_default() {
+        assert_eq!(FilePermission::default(), FilePermission::Inherit);
+    }
+
+    #[test]
     fn test_deserialize_file_rule() {
         let json = r#"{"pattern": "C:\\Users\\*\\**", "permission": "read_only"}"#;
         let rule: FileRule = serde_json::from_str(json).unwrap();
         assert_eq!(rule.pattern, r"C:\Users\*\**");
         assert_eq!(rule.permission, FilePermission::ReadOnly);
+    }
+
+    #[test]
+    fn test_deserialize_file_rule_with_aliases() {
+        // "inherit" 别名为 Inherit (serde alias)
+        let json = r#"{"pattern": "**", "permission": "inherit"}"#;
+        let rule: FileRule = serde_json::from_str(json).unwrap();
+        assert_eq!(rule.permission, FilePermission::Inherit);
     }
 
     #[test]
@@ -108,5 +121,31 @@ mod tests {
         assert_eq!(rule.port, 443);
         assert_eq!(rule.protocol, NetProtocol::Tcp);
         assert_eq!(rule.action, NetAction::Allow);
+    }
+
+    #[test]
+    fn test_deserialize_net_rule_any_protocol() {
+        let json = r#"{"host": "*", "port": 0, "protocol": "any", "action": "deny"}"#;
+        let rule: NetRule = serde_json::from_str(json).unwrap();
+        assert_eq!(rule.protocol, NetProtocol::Any);
+        assert_eq!(rule.action, NetAction::Deny);
+        assert_eq!(rule.port, 0);
+    }
+
+    #[test]
+    fn test_net_protocol_serialization_roundtrip() {
+        for proto in &[NetProtocol::Tcp, NetProtocol::Udp, NetProtocol::Any] {
+            let json = serde_json::to_string(proto).unwrap();
+            let restored: NetProtocol = serde_json::from_str(&json).unwrap();
+            assert_eq!(*proto, restored);
+        }
+    }
+
+    #[test]
+    fn test_net_action_serialization() {
+        let allow = serde_json::to_string(&NetAction::Allow).unwrap();
+        assert!(allow.contains("allow"));
+        let deny = serde_json::to_string(&NetAction::Deny).unwrap();
+        assert!(deny.contains("deny"));
     }
 }

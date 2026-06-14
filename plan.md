@@ -209,27 +209,37 @@ TRAE 有专门的 `CorExitProcess` Hook。
 
 ## Phase 5: 测试与文档
 
-### 5.1 集成测试套件
+### 5.1 集成测试套件 ✅ 已完成
 
-| 测试 | 描述 | 优先级 |
-|------|------|--------|
-| `test_basic` | cmd.exe /c dir, whoami | P0 |
-| `test_file_acl` | 读写拒绝/只读目录 | P0 |
-| `test_network` | DNS 解析, TCP 连接 | P0 |
-| `test_clr` | pwsh.exe, dotnet | P0 |
-| `test_recursive` | 三层嵌套 cmd.exe | P1 |
-| `test_x86` | 32位进程注入 | P1 |
-| `test_wow64` | 64→32 位递归注入 | P1 |
+| 测试 | 描述 | 优先级 | 状态 |
+|------|------|--------|------|
+| `test_basic` | cmd.exe /c dir, whoami, exit code, stderr, pwsh | P0 | ✅ |
+| `test_file_acl` | Inherit/ReadOnly/Deny/mkdir 读写拒绝/只读目录 | P0 | ✅ |
+| `test_network` | DNS 解析, TCP 连接, ping, nslookup | P0 | ✅ |
+| `test_clr` | pwsh.exe, dotnet | P0 | ✅ (已更新) |
+| `test_recursive` | 三层嵌套 cmd.exe, x64→x86 跨架构 | P1 | ✅ |
+| `test_x86` | 32位进程注入, WOW64 文件 ACL | P1 | ✅ |
+| `test_ai_api` | AI HTTP /health, /exec, /audit 端点 | P1 | ✅ |
+| Rust 单元测试 | sandbox-core (24) + sandbox-host (14) | P0 | ✅ |
 
-**文件：** `tests/test_*.py`
+**文件：** 
+- `tests/base.py` — 测试基础设施 (SandboxRunner, TestResult, TestSuite)
+- `tests/test_all.py` — 统一运行器（支持 --quick/--x64/--x86/--no-ai/--list）
+- `tests/test_basic.py` — 8 项基础功能测试
+- `tests/test_file_acl.py` — 9 项文件 ACL 测试
+- `tests/test_network.py` — 5 项网络 ACL 测试
+- `tests/test_recursive.py` — 5 项递归注入测试
+- `tests/test_x86.py` — 5 项 WOW64 测试
+- `tests/test_ai_api.py` — 4 项 AI HTTP API 测试
+- `tests/configs/` — 4 个测试沙箱配置 (inherit/readonly/deny/network_deny)
 
-**估时：** 6h
+**估时：** 6h ✅ 已完成
 
 ---
 
 ### 5.2 文档
 
-- [ ] `README.md` — 项目概述、快速开始、架构图
+- [x] `README.md` — 项目概述、快速开始、架构图
 - [ ] `ARCHITECTURE.md` — 详细架构文档（数据流图、IPC 协议、Hook 列表）
 - [ ] `BUILDING.md` — 构建指南（MSVC 安装、CMake 命令、常见问题）
 

@@ -1,0 +1,34 @@
+{
+  "name": "test-readonly",
+  "file_permissions": [
+    {
+      "pattern": "C:\\Users\\*\\**",
+      "permission": "read_only"
+    },
+    {
+      "pattern": "C:\\Windows\\**",
+      "permission": "read_only"
+    },
+    {
+      "pattern": "C:\\Program Files\\**",
+      "permission": "deny"
+    }
+  ],
+  "network_permissions": [
+    {
+      "host": "127.0.0.1",
+      "port": 0,
+      "protocol": "any",
+      "action": "allow"
+    },
+    {
+      "host": "*",
+      "port": 0,
+      "protocol": "tcp",
+      "action": "allow"
+    }
+  ],
+  "enable_network_isolation": true,
+  "enable_recursive_injection": true,
+  "audit_log_dir": ".\\sandbox-logs"
+}

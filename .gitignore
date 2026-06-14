@@ -2,3 +2,4 @@ build-root
 target
 build-x64
 build-x86
+**/*.pyc
