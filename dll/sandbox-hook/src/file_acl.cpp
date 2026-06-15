@@ -386,3 +386,101 @@ bool ExtractPathFromOA(void* ObjectAttributes, wchar_t* out, size_t outSize) {
     wcscpy_s(out, outSize, normalized);
     return out[0] != L'\0';
 }
+
+// ============================================================================
+// 符号链接解析 — 在检查 ACL 前追踪符号链接/交接点至最终目标
+// ============================================================================
+
+/// TLS 守卫防止符号链接解析中的递归
+static DWORD g_tls_symlink_resolve = TLS_OUT_OF_INDEXES;
+
+static bool EnterSymlinkResolve() {
+    if (g_tls_symlink_resolve == TLS_OUT_OF_INDEXES) {
+        g_tls_symlink_resolve = TlsAlloc();
+        if (g_tls_symlink_resolve == TLS_OUT_OF_INDEXES) return false;
+    }
+    if (TlsGetValue(g_tls_symlink_resolve) != 0) return false;
+    TlsSetValue(g_tls_symlink_resolve, (LPVOID)1);
+    return true;
+}
+
+static void LeaveSymlinkResolve() {
+    if (g_tls_symlink_resolve != TLS_OUT_OF_INDEXES)
+        TlsSetValue(g_tls_symlink_resolve, (LPVOID)0);
+}
+
+/// 检查路径是否为重解析点（符号链接/交接点/挂载点）
+static bool IsReparsePoint(const std::wstring& path) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return false;
+    return (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
+/// 解析符号链接/交接点至最终目标路径
+/// 通过打开重解析点本身（不追踪它）获取其目标，然后递归解析
+/// @param path      原始路径
+/// @param depth     递归深度（防循环，最大 16 层）
+/// @return 解析后的最终路径，如果无法解析则返回原始路径
+static std::wstring ResolveSymbolicLink(const std::wstring& path, int depth = 0) {
+    if (depth > 16) return path;      // 防循环链接
+    if (!EnterSymlinkResolve()) return path;
+
+    // 先检查是否为重解析点
+    if (!IsReparsePoint(path)) {
+        LeaveSymlinkResolve();
+        return path;
+    }
+
+    // 以最小权限打开重解析点（不追踪它）
+    HANDLE hFile = CreateFileW(path.c_str(),
+        READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        LeaveSymlinkResolve();
+        return path;
+    }
+
+    // 获取最终路径
+    wchar_t finalPath[1024] = {0};
+    DWORD ret = GetFinalPathNameByHandleW(hFile, finalPath, 1024, FILE_NAME_NORMALIZED);
+    CloseHandle(hFile);
+
+    if (ret == 0 || ret >= 1024) {
+        LeaveSymlinkResolve();
+        return path;
+    }
+
+    // 去掉 \\?\ 前缀
+    std::wstring resolved(finalPath);
+    if (resolved.find(L"\\\\?\\") == 0) {
+        resolved = resolved.substr(4);
+    }
+
+    // 大写归一化
+    std::transform(resolved.begin(), resolved.end(), resolved.begin(), ::towupper);
+
+    // 如果解析后路径与原路径相同，说明无符号链接
+    if (resolved == path) {
+        LeaveSymlinkResolve();
+        return path;
+    }
+
+    LeaveSymlinkResolve();
+
+    // 递归解析（目标可能本身也是符号链接）
+    return ResolveSymbolicLink(resolved, depth + 1);
+}
+
+/// 检查文件权限（含符号链接绕过检测）
+/// 先解析符号链接至最终目标，再对最终目标做 ACL 检查（含硬链接防护）
+FilePermission CheckFilePermissionWithSymlink(const std::wstring& path) {
+    // 先解析符号链接
+    std::wstring resolvedPath = ResolveSymbolicLink(path);
+
+    // 对解析后的路径做 ACL 检查（含硬链接防护）
+    return CheckFilePermissionWithHardLinks(resolvedPath);
+}

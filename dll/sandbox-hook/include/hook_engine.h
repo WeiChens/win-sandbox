@@ -116,7 +116,10 @@ void InstallNtOpenFileHook();
 void InstallNtDeleteFileHook();
 void InstallNtSetInformationFileHook();
 void InstallNtWriteFileHook();
+void InstallNtQueryDirectoryFileHook();
 void InstallNtCreateUserProcessHook();
+void InstallNtMapViewOfSectionHook();
+void InstallNtOpenSectionHook();
 void InstallNtResumeThreadHook();
 void InstallNetHooks();         // 在 net_acl.cpp 中定义
 

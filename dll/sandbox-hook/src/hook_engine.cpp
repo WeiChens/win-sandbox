@@ -47,6 +47,9 @@ void InstallAllHooks() {
     InstallNtDeleteFileHook();
     InstallNtSetInformationFileHook();
     InstallNtWriteFileHook();      // ★ 已通过 NtQueryObject 解决性能+递归问题
+    InstallNtQueryDirectoryFileHook();  // ★ 目录枚举过滤
+    InstallNtMapViewOfSectionHook();    // ★ 内存映射文件 ACL
+    InstallNtOpenSectionHook();         // ★ Section 打开追踪
     InstallNtCreateUserProcessHook();
     InstallNtResumeThreadHook();
     InstallNetHooks();

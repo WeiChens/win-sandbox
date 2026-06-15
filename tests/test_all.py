@@ -42,6 +42,7 @@ from test_edge import (
     EDGE_SECURITY_TESTS, EDGE_PATH_TESTS,
     EDGE_CONFIG_TESTS, ALL_EDGE_TESTS,
 )
+from test_p0_regression import P0_REGRESSION_TESTS
 
 
 def main():
@@ -129,6 +130,9 @@ def main():
             suite.run_tests(EDGE_CONFIG_TESTS, "9. 配置极端")
         else:
             print("\n⏭️  跳过边缘场景测试")
+
+        # ── 10. P0 回归测试 ────────────────────────────────
+        suite.run_tests(P0_REGRESSION_TESTS, "10. P0 回归")
 
     suite.print_summary()
     return 0 if _all_passed(suite) else 1

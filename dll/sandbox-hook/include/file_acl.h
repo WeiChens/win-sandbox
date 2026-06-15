@@ -36,6 +36,11 @@ FilePermission CheckFilePermission(const std::wstring& path);
 /// 如果任一硬链接路径被拒绝，返回该权限（防御 mklink /H 绕过）。
 FilePermission CheckFilePermissionWithHardLinks(const std::wstring& path);
 
+/// 检查文件权限（含符号链接 + 硬链接绕过检测）
+/// 先解析符号链接/交接点至最终目标，再对最终目标做 ACL 检查（含硬链接防护）。
+/// 在 hook_file.cpp 中定义（需要 CreateFileW/GetFinalPathNameByHandleW 等 API）。
+FilePermission CheckFilePermissionWithSymlink(const std::wstring& path);
+
 /// ACL 是否已初始化
 bool IsAclInitialized();
 
