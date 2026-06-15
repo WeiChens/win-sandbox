@@ -6,3 +6,5 @@ build-x86
 **/*.log
 build
 output
+sandbox-logs/**
+!sandbox-logs/.gitkeep

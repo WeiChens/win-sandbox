@@ -68,8 +68,11 @@ static std::string JsonGetString(const std::string& json, const char* key, size_
 }
 
 static FilePermission ParsePermission(const std::string& perm) {
-    if (perm == "deny" || perm == "DENY") return FilePermission::Deny;
-    if (perm == "read_only" || perm == "read_only" || perm == "READ_ONLY") return FilePermission::ReadOnly;
+    std::string lower;
+    lower.reserve(perm.size());
+    for (char c : perm) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    if (lower == "deny") return FilePermission::Deny;
+    if (lower == "read_only" || lower == "readonly") return FilePermission::ReadOnly;
     return FilePermission::Inherit;
 }
 

@@ -508,6 +508,15 @@ static NTSTATUS WINAPI Hook_NtCreateFile(
         return STATUS_ACCESS_DENIED;
     }
 
+    // ★ 额外：Deny 路径也要检查 FILE_DELETE_ON_CLOSE（防 DeleteFileW 绕过）
+    if (perm == FilePermission::Deny && (CreateOptions & 0x00001000)) {
+        AuditLog(AuditEventType::FileDeny, pathStr, L"deny_delete_on_close",
+                 CreateOptions, STATUS_ACCESS_DENIED);
+        if (FileHandle) *FileHandle = nullptr;
+        SetLastError(ERROR_ACCESS_DENIED);
+        return STATUS_ACCESS_DENIED;
+    }
+
     if (perm == FilePermission::ReadOnly) {
         DWORD writeFlags = GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA
                          | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE;

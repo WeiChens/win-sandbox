@@ -89,10 +89,8 @@ extern "system" {
 
     fn Sleep(dwMilliseconds: DWORD);
 
-    // WOW64 注入辅助 — ToolHelp32 快照
-    fn CreateToolhelp32Snapshot(dwFlags: DWORD, th32ProcessID: DWORD) -> HANDLE;
-    fn Module32FirstW(hSnapshot: HANDLE, lpme: *mut MODULEENTRY32W) -> BOOL;
-    fn Module32NextW(hSnapshot: HANDLE, lpme: *mut MODULEENTRY32W) -> BOOL;
+    // PSAPI: 用于枚举 32 位辅助进程的模块（替代 ToolHelp32）
+    // 通过 kernel32!K32EnumProcessModules / GetProcAddress 间接调用
     fn ReadProcessMemory(hProcess: HANDLE, lpBase: *const c_void,
                          lpBuf: *mut c_void, nSize: usize,
                          lpNumberOfBytesRead: *mut usize) -> BOOL;
@@ -108,31 +106,10 @@ extern "system" {
 
 const STARTF_USESTDHANDLES: DWORD = 0x0000_0100;
 
-// ToolHelp32 标志
-const TH32CS_SNAPMODULE: DWORD = 0x00000008;
-const TH32CS_SNAPMODULE32: DWORD = 0x00000010;
-
 // PE 常量
 const IMAGE_DOS_SIGNATURE: u16 = 0x5A4D;   // "MZ"
 const IMAGE_NT_SIGNATURE: u32 = 0x00004550; // "PE\0\0"
 const IMAGE_DIRECTORY_ENTRY_EXPORT: usize = 0;
-
-// WOW64 辅助进程超时
-const WOW64_HELPER_TIMEOUT_MS: DWORD = 3000;
-
-#[repr(C)]
-struct MODULEENTRY32W {
-    dwSize: DWORD,
-    th32ModuleID: DWORD,
-    th32ProcessID: DWORD,
-    GlblcntUsage: DWORD,
-    ProccntUsage: DWORD,
-    modBaseAddr: *mut u8,
-    modBaseSize: DWORD,
-    hModule: HANDLE,
-    szModule: [u16; 256],
-    szExePath: [u16; 260],
-}
 
 // PE 头部结构（32 位）
 #[repr(C, packed)]

@@ -157,31 +157,45 @@ bool InitNetAcl(const std::string& json) {
 // 权限检查
 // ============================================================================
 
+/// ★ 改进的 Glob 匹配（非递归，无栈溢出风险）
+/// 支持: `*`（任意序列），不支持的：`?`、`[...]`
+/// 大小写不敏感
 static bool GlobMatchSimple(const std::string& pattern, const std::string& target) {
     if (pattern == "*") return true;
 
+    // 双指针迭代匹配（类似简化版 wildcard 算法）
     size_t pi = 0, ti = 0;
     size_t pLen = pattern.length(), tLen = target.length();
+    size_t starPi = std::string::npos; // 最近 * 在 pattern 中的位置
+    size_t starTi = 0;                  // * 对应 target 中的位置
 
-    while (pi < pLen && ti < tLen) {
-        if (pattern[pi] == '*') {
+    auto toupper_c = [](char c) -> char {
+        return static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    };
+
+    while (ti < tLen) {
+        if (pi < pLen && pattern[pi] == '*') {
+            // 遇到 *：记录位置，尝试匹配 0 个字符
+            starPi = pi;
+            starTi = ti + 1; // 下次从下一个字符试（先试匹配 0 个）
             pi++;
-            if (pi == pLen) return true;
-            while (ti < tLen) {
-                if (toupper(target[ti]) == toupper(pattern[pi])) {
-                    if (GlobMatchSimple(pattern.substr(pi), target.substr(ti)))
-                        return true;
-                }
-                ti++;
-            }
+        } else if (pi < pLen && toupper_c(pattern[pi]) == toupper_c(target[ti])) {
+            // 字符匹配：前进
+            pi++;
+            ti++;
+        } else if (starPi != std::string::npos) {
+            // 不匹配但有前一个 *：回溯
+            pi = starPi + 1;
+            ti = starTi++;
+        } else {
+            // 不匹配且无 * 可回溯
             return false;
         }
-        if (toupper(pattern[pi]) != toupper(target[ti])) return false;
-        pi++; ti++;
     }
 
+    // target 已耗尽，跳过 pattern 末尾的所有 *
     while (pi < pLen && pattern[pi] == '*') pi++;
-    return pi == pLen && ti == tLen;
+    return pi == pLen;
 }
 
 bool CheckNetPermission(const std::string& host, uint16_t port, NetProtocol proto) {
