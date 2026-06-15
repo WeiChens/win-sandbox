@@ -40,7 +40,18 @@
 
 ## 已知未修复
 
-### ⚠️ Bug #5: 网络拒绝规则可能不完全生效
+### ✅ Bug #5: `mkdir` 未被 NtCreateFile Hook 拦截（已修复）
+- **严重性**: P1
+- **现象**: `mkdir C:\Program Files\dir` 在沙箱中成功创建目录，未被 ACL 拦截
+- **根因**: ⭐ **错误结论纠正** — `mkdir` **确实走 `NtCreateFile`**！之前的结论有误。
+  真正的根因是 **两个 Bug 连锁导致 ACL 旁路**：
+  1. `ExtractPathFromOA()` 忽略 `RootDirectory` 相对路径：`cmd.exe` 的 `mkdir` 分两步——先用 NtCreateFile 打开父目录获句柄，再用 `RootDirectory=句柄 + ObjectName="dir"` 创建子目录。`ExtractPathFromOA` 只提取了 `ObjectName="dir"`（相对路径），未拼接父目录完整路径
+  2. `IsDevicePath("dir")` 误放行：`dir` 不含 `\` `:` `/`，被误判为 DOS 设备名 → ACL 检查被旁路
+- **修复**: 移植 failure-01 的 `RootDirectory` 相对路径解析逻辑到 `ExtractPathFromOA()`，使用 `GetFinalPathNameByHandleW` 获取父目录绝对路径后拼接相对名，并添加 TLS 重入守卫防止递归
+- **文件**: `dll/sandbox-hook/src/file_acl.cpp`
+- **验证**: 26/26 x64 测试通过，`mkdir C:\Program Files\test` → 被拒绝 ✅，`mkdir E:\test` → 正常执行 ✅
+
+### ⚠️ Bug #6: 网络拒绝规则可能不完全生效
 - **严重性**: P1
 - **测试**: `3.3 网络拒绝: ping 外部地址应被阻止`
 - **现象**: 在 `test_network_deny.json` 配置下 ping 8.8.8.8 可能仍成功（取决于实际 DNS/网络）
@@ -93,10 +104,9 @@
 | 分类 | 测试数 | 通过 | 已知失败 | 状态 |
 |------|--------|------|----------|------|
 | 基础功能 | 8 | 8 | 0 | ✅ |
-| 文件 ACL | 9 | 9 | 0 | ✅ |
+| 基础功能 | 8 | 8 | 0 | ✅ |
+| 文件 ACL（含 mkdir 回归测试） | 10 | 10 | 0 | ✅ |
 | 网络 ACL | 5 | 5 | 1 | ⚠️ |
-| 递归注入 | 5 | 5 | 0 | ✅ |
-| x86/WOW64 | 5 | 5 | 1 | ⚠️ |
-| AI API | 4 | 4 | 1 | ⚠️ |
+| 递归注入 (x64) | 4 | 4 | 0 | ✅ |
 | Rust 单元测试 | 38 | 38 | 0 | ✅ |
-| **总计** | **74** | **74** | **3** | |
+| **总计** | **65** | **65** | **1** | |

@@ -15,6 +15,7 @@ project(windows-sandbox
 # ============================================================================
 
 set(SANDBOX_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
+set(OUTPUT_DIR ${SANDBOX_ROOT}/output)
 
 # ============================================================================
 # 检测工具链
@@ -22,6 +23,9 @@ set(SANDBOX_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 find_program(CARGO cargo REQUIRED)
 message(STATUS "Cargo: ${CARGO}")
 message(STATUS "CMake: ${CMAKE_COMMAND}")
+
+# 创建 output 目录
+file(MAKE_DIRECTORY ${OUTPUT_DIR})
 
 # ============================================================================
 # 1. C++ DLL (sandbox-hook) — x64 + x86
@@ -31,23 +35,21 @@ set(DLL_SRC_DIR ${SANDBOX_ROOT}/dll/sandbox-hook)
 add_custom_target(sandbox-hook-x64 ALL
     COMMAND ${CMAKE_COMMAND} -B ${DLL_SRC_DIR}/build-x64 -A x64 -DCMAKE_BUILD_TYPE=Release
     COMMAND ${CMAKE_COMMAND} --build ${DLL_SRC_DIR}/build-x64 --config Release
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${SANDBOX_ROOT}/target/dll/x64
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${DLL_SRC_DIR}/build-x64/Release/sandbox_hook.dll
-        ${SANDBOX_ROOT}/target/dll/x64/sandbox_hook.dll
+        ${OUTPUT_DIR}/sandbox_hook_x64.dll
     WORKING_DIRECTORY ${DLL_SRC_DIR}
-    COMMENT "Building sandbox-hook.dll (x64)..."
+    COMMENT "Building sandbox-hook.dll (x64) → output/"
 )
 
 add_custom_target(sandbox-hook-x86 ALL
     COMMAND ${CMAKE_COMMAND} -B ${DLL_SRC_DIR}/build-x86 -A Win32 -DCMAKE_BUILD_TYPE=Release
     COMMAND ${CMAKE_COMMAND} --build ${DLL_SRC_DIR}/build-x86 --config Release
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${SANDBOX_ROOT}/target/dll/x86
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${DLL_SRC_DIR}/build-x86/Release/sandbox_hook.dll
-        ${SANDBOX_ROOT}/target/dll/x86/sandbox_hook.dll
+        ${OUTPUT_DIR}/sandbox_hook_x86.dll
     WORKING_DIRECTORY ${DLL_SRC_DIR}
-    COMMENT "Building sandbox-hook.dll (x86)..."
+    COMMENT "Building sandbox-hook.dll (x86) → output/"
 )
 
 # ============================================================================
@@ -61,8 +63,11 @@ endif()
 
 add_custom_target(sandbox-host ALL
     COMMAND ${CARGO} build ${CARGO_BUILD_FLAGS}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${SANDBOX_ROOT}/target/release/sandbox-host.exe
+        ${OUTPUT_DIR}/sandbox-host.exe
     WORKING_DIRECTORY ${SANDBOX_ROOT}
-    COMMENT "Building Rust host (sandbox-core + sandbox-host)..."
+    COMMENT "Building Rust host → output/"
 )
 
 # ============================================================================
@@ -70,12 +75,12 @@ add_custom_target(sandbox-host ALL
 # ============================================================================
 add_custom_target(all-dlls
     DEPENDS sandbox-hook-x64 sandbox-hook-x86
-    COMMENT "All DLLs built"
+    COMMENT "All DLLs built → output/"
 )
 
 add_custom_target(all-rust
     DEPENDS sandbox-host
-    COMMENT "All Rust targets built"
+    COMMENT "All Rust targets built → output/"
 )
 
 # ============================================================================

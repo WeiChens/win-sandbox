@@ -63,8 +63,9 @@ pub fn run_sandbox(
         .parent().unwrap_or(std::path::Path::new("."))
         .to_path_buf();
 
-    let dll_x64 = exe_dir.join("target").join("dll").join("x64").join("sandbox_hook.dll");
-    let dll_x86 = exe_dir.join("target").join("dll").join("x86").join("sandbox_hook.dll");
+    // DLL 就在 exe 同目录（output/）
+    let dll_x64 = exe_dir.join("sandbox_hook_x64.dll");
+    let dll_x86 = exe_dir.join("sandbox_hook_x86.dll");
 
     let ipc_server = ipc::IpcServer::new(std::process::id(), &sandbox_config)?;
 

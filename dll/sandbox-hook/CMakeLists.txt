@@ -10,6 +10,30 @@ if(NOT MSVC)
 endif()
 
 # ============================================================================
+# ★ Microsoft Detours — 内联编译（源文件直接加入项目）
+# ============================================================================
+# Detours 不支持 CMake FetchContent，直接编译源码
+set(DETOURS_SRC_DIR ${CMAKE_BINARY_DIR}/_deps/detours-src/src)
+if(NOT EXISTS ${DETOURS_SRC_DIR}/detours.cpp)
+    # 如果没有预下载，从 GitHub 克隆
+    include(FetchContent)
+    FetchContent_Declare(detours_src
+        GIT_REPOSITORY https://github.com/microsoft/Detours.git
+        GIT_TAG v4.0.1
+        GIT_SHALLOW TRUE
+        SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/detours-src
+    )
+    FetchContent_Populate(detours_src)
+endif()
+
+set(DETOURS_SOURCES
+    ${DETOURS_SRC_DIR}/detours.cpp
+    ${DETOURS_SRC_DIR}/modules.cpp
+    ${DETOURS_SRC_DIR}/disasm.cpp
+    ${DETOURS_SRC_DIR}/image.cpp
+)
+
+# ============================================================================
 # 源文件
 # ============================================================================
 set(SOURCES
@@ -21,6 +45,7 @@ set(SOURCES
     src/ipc_client.cpp
     src/shared_config.cpp
     src/utils.cpp
+    ${DETOURS_SOURCES}
 )
 
 set(HEADERS
@@ -71,6 +96,7 @@ target_compile_definitions(sandbox_hook PRIVATE
 target_include_directories(sandbox_hook PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${DETOURS_SRC_DIR}
 )
 
 target_link_libraries(sandbox_hook PRIVATE

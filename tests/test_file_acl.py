@@ -247,6 +247,27 @@ def test_mkdir_inherit(runner: SandboxRunner) -> TestResult:
     )
 
 
+# ★ 回归测试：Bug #5 — mkdir 在 Deny 路径上应被拦截
+def test_mkdir_deny(runner: SandboxRunner) -> TestResult:
+    """2.10 mkdir Deny: 禁止在拒绝路径创建目录（回归测试 Bug #5）"""
+    t0 = time.time()
+
+    # 测试 Deny 路径上的 mkdir（使用 RootDirectory 相对路径方式）
+    rc, out, err = runner.exec(
+        r'mkdir "C:\Program Files\sandbox_mkdir_deny_test" 2>nul && echo MKDIR_OK || echo MKDIR_DENIED',
+        config=DENY_CONFIG, timeout=15,
+    )
+    dt = time.time() - t0
+
+    denied = "MKDIR_DENIED" in out
+    return runner.make_result(
+        "mkdir Deny: 禁止在拒绝路径创建目录", "文件ACL-mkdir", "x64",
+        rc, out, err,
+        expected_text="MKDIR_DENIED",
+        duration=dt,
+    )
+
+
 # ─── 测试注册表 ──────────────────────────────────────────────────────
 FILE_ACL_TESTS = [
     test_inherit_write_temp,
@@ -258,4 +279,5 @@ FILE_ACL_TESTS = [
     test_deny_cannot_write_program_files,
     test_mkdir_readonly,
     test_mkdir_inherit,
+    test_mkdir_deny,       # ★ 新增：Bug #5 回归测试
 ]

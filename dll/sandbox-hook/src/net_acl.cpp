@@ -62,51 +62,76 @@ static NetAction ParseNetAction(const std::string& act) {
 }
 
 bool InitNetAcl(const std::string& json) {
+    auto wd = [](const char* msg) {
+        HANDLE hF = CreateFileA("E:\\init_dbg.txt", FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hF != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(hF, msg, (DWORD)strlen(msg), &w, NULL); CloseHandle(hF); }
+    };
+    wd("  NET-lock\n");
     std::lock_guard<std::mutex> lock(g_netMutex);
+    wd("  NET-clear\n");
     g_netRules.clear();
 
-    // 查找 "network_permissions"
+    wd("  NET-find-perm\n");
     size_t arrStart = json.find("\"network_permissions\"");
     if (arrStart == std::string::npos) {
+        wd("  NET-no-perm\n");
         g_netInitialized = true;
         return true;
     }
 
+    wd("  NET-find-arr\n");
     arrStart = json.find('[', arrStart);
     if (arrStart == std::string::npos) {
+        wd("  NET-no-arr\n");
         g_netInitialized = true;
         return true;
     }
 
+    wd("  NET-find-arr-end\n");
     size_t arrEnd = json.find(']', arrStart);
     if (arrEnd == std::string::npos) arrEnd = json.length();
 
+    wd("  NET-loop-start\n");
     size_t pos = arrStart + 1;
+    int ruleCount = 0;
     while (pos < arrEnd) {
+        wd("  NET-find-{\n");
         size_t objStart = json.find('{', pos);
+        wd("  NET-got-{\n");
         if (objStart == std::string::npos || objStart >= arrEnd) break;
+        wd("  NET-find-}\n");
         size_t objEnd = json.find('}', objStart);
+        wd("  NET-got-}\n");
         if (objEnd == std::string::npos || objEnd >= arrEnd) break;
 
+        wd("  NET-create-rule\n");
         NetRule rule;
         size_t innerPos = objStart;
 
+        wd("  NET-define-lambdas\n");
         // 简易 JSON 解析
         auto getStr = [&](const char* key) -> std::string {
+            wd("  getStr-start\n");
             std::string search = std::string("\"") + key + "\"";
             size_t kp = json.find(search, innerPos);
+            wd("  getStr-kp-found\n");
             if (kp == std::string::npos || kp >= objEnd) return "";
             size_t vs = json.find('"', kp + search.length() + 1);
+            wd("  getStr-vs-found\n");
             if (vs == std::string::npos || vs >= objEnd) return "";
             vs++;
             size_t ve = json.find('"', vs);
+            wd("  getStr-ve-found\n");
             if (ve == std::string::npos || ve >= objEnd) return "";
+            wd("  getStr-substr\n");
             return json.substr(vs, ve - vs);
         };
 
         auto getInt = [&](const char* key) -> int {
+            wd("  getInt-start\n");
             std::string s = getStr(key);
             if (s.empty()) {
+                wd("  getInt-fallback\n");
                 std::string search = std::string("\"") + key + "\"";
                 size_t kp = json.find(search, innerPos);
                 if (kp == std::string::npos || kp >= objEnd) return 0;

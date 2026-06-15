@@ -77,10 +77,8 @@ bool InitFileAcl(const std::string& json) {
     std::lock_guard<std::mutex> lock(g_aclMutex);
     g_fileRules.clear();
 
-    // 查找 "file_permissions" 数组
     size_t arrStart = json.find("\"file_permissions\"");
     if (arrStart == std::string::npos) {
-        // 没有文件规则不是错误，使用空规则（全部 Inherit）
         g_initialized = true;
         return true;
     }
@@ -94,7 +92,6 @@ bool InitFileAcl(const std::string& json) {
     size_t arrEnd = json.find(']', arrStart);
     if (arrEnd == std::string::npos) arrEnd = json.length();
 
-    // 逐对象解析
     size_t pos = arrStart + 1;
     while (pos < arrEnd) {
         size_t objStart = json.find('{', pos);
@@ -108,7 +105,17 @@ bool InitFileAcl(const std::string& json) {
 
         std::string pattern = JsonGetString(json, "pattern", innerPos);
         if (!pattern.empty()) {
-            rule.pattern = Utf8ToWide(pattern);
+            // JSON unescape: replace double backslash with single
+            std::string unesc;
+            for (size_t ci = 0; ci < pattern.size(); ci++) {
+                if (pattern[ci] == '\\' && ci + 1 < pattern.size() && pattern[ci + 1] == '\\') {
+                    unesc += '\\';
+                    ci++;
+                } else {
+                    unesc += pattern[ci];
+                }
+            }
+            rule.pattern = Utf8ToWide(unesc);
 
             innerPos = objStart;
             std::string permission = JsonGetString(json, "permission", innerPos);
@@ -174,20 +181,94 @@ void NormalizeNtPath(const wchar_t* ntPath, wchar_t* out, size_t outSize) {
     wcsncpy_s(out, outSize, path.c_str(), _TRUNCATE);
 }
 
+// ★ 重入守卫 TLS：GetFinalPathNameByHandleW 可能间接触发 NtCreateFile
+// 导致递归。使用 TLS 标志检测并切断递归链。
+static DWORD g_tls_resolving_relative = TLS_OUT_OF_INDEXES;
+
+static bool EnterResolveRelative() {
+    if (g_tls_resolving_relative == TLS_OUT_OF_INDEXES) {
+        g_tls_resolving_relative = TlsAlloc();
+        if (g_tls_resolving_relative == TLS_OUT_OF_INDEXES) return false;
+    }
+    if (TlsGetValue(g_tls_resolving_relative) != 0) return false;
+    TlsSetValue(g_tls_resolving_relative, (LPVOID)1);
+    return true;
+}
+
+static void LeaveResolveRelative() {
+    if (g_tls_resolving_relative != TLS_OUT_OF_INDEXES)
+        TlsSetValue(g_tls_resolving_relative, (LPVOID)0);
+}
+
 bool ExtractPathFromOA(void* ObjectAttributes, wchar_t* out, size_t outSize) {
     if (!ObjectAttributes || !out || outSize == 0) return false;
 
-    // OBJECT_ATTRIBUTES 结构:
-    //   ULONG Length; HANDLE RootDirectory; PUNICODE_STRING ObjectName; ...
     auto* oa = reinterpret_cast<MY_OBJECT_ATTRIBUTES*>(ObjectAttributes);
 
-    if (!oa->ObjectName || !oa->ObjectName->Buffer) return false;
+    if (!oa->ObjectName || !oa->ObjectName->Buffer || oa->ObjectName->Length == 0)
+        return false;
 
+    if (oa->RootDirectory) {
+        if (!EnterResolveRelative()) {
+            return false;
+        }
+
+        wchar_t dirPath[1024] = {0};
+        DWORD dirLen = GetFinalPathNameByHandleW(oa->RootDirectory, dirPath, 1024, 0);
+        if (dirLen == 0 || dirLen >= 1024) {
+            LeaveResolveRelative();
+
+            wchar_t cwd[1024] = {0};
+            DWORD cwdLen = GetCurrentDirectoryW(1024, cwd);
+            if (cwdLen == 0 || cwdLen >= 1024) return false;
+
+            size_t cwdLen2 = wcslen(cwd);
+            if (cwdLen2 > 0 && cwd[cwdLen2 - 1] != L'\\') {
+                if (cwdLen2 < 1023) { cwd[cwdLen2] = L'\\'; cwd[cwdLen2 + 1] = L'\0'; }
+            }
+
+            USHORT nameLen = oa->ObjectName->Length / 2;
+            size_t offset = wcslen(cwd);
+            if (nameLen > 1023 - offset) nameLen = static_cast<USHORT>(1023 - offset);
+            wcsncpy_s(cwd + offset, 1024 - offset, oa->ObjectName->Buffer, nameLen);
+            cwd[offset + nameLen] = L'\0';
+
+            wchar_t normalized[1024];
+            NormalizeNtPath(cwd, normalized, 1024);
+            wcsncpy_s(out, outSize, normalized, _TRUNCATE);
+            return out[0] != L'\0';
+        }
+
+        // 去掉 \\?\ 前缀
+        int pos = 0;
+        if (wcsncmp(dirPath, L"\\\\?\\", 4) == 0) pos = 4;
+
+        // 确保目录路径末尾有反斜杠
+        int j = (int)wcslen(dirPath);
+        if (j > pos && dirPath[j - 1] != L'\\') {
+            if (j < 1023) dirPath[j++] = L'\\';
+            dirPath[j] = L'\0';
+        }
+
+        // 拼接 ObjectName（相对名）
+        USHORT nameLen = oa->ObjectName->Length / 2;
+        if (nameLen > 1023 - j) nameLen = static_cast<USHORT>(1023 - j);
+        wcsncpy_s(dirPath + j, 1024 - j, oa->ObjectName->Buffer, nameLen);
+        dirPath[j + nameLen] = L'\0';
+
+        LeaveResolveRelative();
+
+        // 规范化并输出
+        wchar_t normalized[1024];
+        NormalizeNtPath(dirPath + pos, normalized, 1024);
+        wcsncpy_s(out, outSize, normalized, _TRUNCATE);
+        return out[0] != L'\0';
+    }
+
+    // 绝对路径：直接提取 ObjectName
     USHORT len = oa->ObjectName->Length;
     if (len >= outSize * 2) len = static_cast<USHORT>(outSize * 2 - 2);
 
-    // 相对路径（有 RootDirectory）：需要通过 GetFinalPathNameByHandle 解析
-    // 这里简化处理：直接复制缓冲区（大多数情况是绝对路径）
     wcsncpy_s(out, outSize, oa->ObjectName->Buffer, len / 2);
     out[len / 2] = L'\0';
 
@@ -195,6 +276,5 @@ bool ExtractPathFromOA(void* ObjectAttributes, wchar_t* out, size_t outSize) {
     wchar_t normalized[1024];
     NormalizeNtPath(out, normalized, 1024);
     wcscpy_s(out, outSize, normalized);
-
     return out[0] != L'\0';
 }

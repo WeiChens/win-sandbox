@@ -62,29 +62,60 @@ fn parse_from(args: &[String]) -> CliArgs {
         std::process::exit(1);
     }
 
-    match args[1].as_str() {
-        "exec" | "run" | "e" => parse_exec(args, verbose),
-        "config" | "cfg" | "c" => parse_config(args, verbose),
-        "audit" | "log" | "a" => parse_audit(args, verbose),
-        "serve" | "s" => parse_serve(args, verbose),
+    // 预扫描：提取全局选项 + 找到子命令位置
+    let mut subcmd_idx = 1;
+    let mut global_config: Option<PathBuf> = None;
+    let mut global_timeout: Option<u64> = None;
+
+    while subcmd_idx < args.len() {
+        let a = args[subcmd_idx].as_str();
+        match a {
+            "--config" | "-c" => {
+                subcmd_idx += 1;
+                if subcmd_idx < args.len() {
+                    global_config = Some(PathBuf::from(&args[subcmd_idx]));
+                }
+            }
+            "--timeout" | "-t" => {
+                subcmd_idx += 1;
+                if subcmd_idx < args.len() {
+                    global_timeout = args[subcmd_idx].parse().ok();
+                }
+            }
+            "--verbose" | "-v" => {}
+            a if a.starts_with("--") || a.starts_with('-') => {
+                // 未知选项，跳过
+            }
+            _ => break, // 子命令
+        }
+        subcmd_idx += 1;
+    }
+
+    if subcmd_idx >= args.len() {
+        // 所有参数都是选项，没有子命令 → exec 简写
+        return parse_exec_implicit(args, verbose);
+    }
+
+    match args[subcmd_idx].as_str() {
+        "exec" | "run" | "e" => parse_exec_from(args, verbose, subcmd_idx + 1, global_config, global_timeout),
+        "config" | "cfg" | "c" => parse_config_from(args, verbose, subcmd_idx + 1),
+        "audit" | "log" | "a" => parse_audit_from(args, verbose, subcmd_idx + 1),
+        "serve" | "s" => parse_serve_from(args, verbose, subcmd_idx + 1),
         "help" | "--help" | "-h" => {
             print_usage();
             std::process::exit(0);
         }
-        _ => {
-            // 如果第一个参数不是子命令，当作 exec 简写：
-            // sandbox-host cmd.exe /c dir
-            parse_exec_implicit(args, verbose)
-        }
+        _ => parse_exec_implicit(args, verbose),
     }
 }
 
-fn parse_exec(args: &[String], verbose: bool) -> CliArgs {
+fn parse_exec_from(args: &[String], verbose: bool, start: usize,
+                    global_config: Option<PathBuf>, global_timeout: Option<u64>) -> CliArgs {
     let mut command = String::new();
     let mut cmd_args = Vec::new();
-    let mut config_path = None;
-    let mut timeout = None;
-    let mut i = 2;
+    let mut config_path = global_config;
+    let mut timeout = global_timeout;
+    let mut i = start;
 
     while i < args.len() {
         if command.is_empty() {
@@ -119,6 +150,55 @@ fn parse_exec(args: &[String], verbose: bool) -> CliArgs {
     }
 }
 
+fn parse_config_from(args: &[String], verbose: bool, start: usize) -> CliArgs {
+    let action = if start >= args.len() {
+        ConfigAction::Show { path: None }
+    } else {
+        match args[start].as_str() {
+            "show" => {
+                let path = args.get(start + 1).map(PathBuf::from);
+                ConfigAction::Show { path }
+            }
+            "init" => {
+                let output = args.get(start + 1).map(PathBuf::from);
+                ConfigAction::Init { output }
+            }
+            "validate" => {
+                let path = args.get(start + 1)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("sandbox.json"));
+                ConfigAction::Validate { path }
+            }
+            _ => {
+                let path = Some(PathBuf::from(&args[start]));
+                ConfigAction::Show { path }
+            }
+        }
+    };
+    CliArgs { command: Command::Config { action }, verbose }
+}
+
+fn parse_audit_from(args: &[String], verbose: bool, start: usize) -> CliArgs {
+    let mut log_dir = None;
+    let mut format = AuditFormat::Text;
+    let mut i = start;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" | "-d" => { i += 1; if i < args.len() { log_dir = Some(PathBuf::from(&args[i])); } }
+            "--json" => { format = AuditFormat::Json; }
+            _ => {}
+        }
+        i += 1;
+    }
+    CliArgs { command: Command::Audit { log_dir, format }, verbose }
+}
+
+fn parse_serve_from(args: &[String], verbose: bool, start: usize) -> CliArgs {
+    // serve 后面只有端口号
+    let port = args.get(start).and_then(|s| s.parse().ok()).unwrap_or(9800);
+    CliArgs { command: Command::Serve { port }, verbose }
+}
+
 /// 隐式 exec：无子命令时自动识别
 fn parse_exec_implicit(args: &[String], verbose: bool) -> CliArgs {
     let command = args[1].clone();
@@ -131,55 +211,6 @@ fn parse_exec_implicit(args: &[String], verbose: bool) -> CliArgs {
         },
         verbose,
     }
-}
-
-fn parse_config(args: &[String], verbose: bool) -> CliArgs {
-    let action = if args.len() < 3 {
-        ConfigAction::Show { path: None }
-    } else {
-        match args[2].as_str() {
-            "show" => {
-                let path = args.get(3).map(PathBuf::from);
-                ConfigAction::Show { path }
-            }
-            "init" => {
-                let output = args.get(3).map(PathBuf::from);
-                ConfigAction::Init { output }
-            }
-            "validate" => {
-                let path = args.get(3)
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("sandbox.json"));
-                ConfigAction::Validate { path }
-            }
-            _ => {
-                // 如果没有子子命令，当作显示
-                let path = Some(PathBuf::from(&args[2]));
-                ConfigAction::Show { path }
-            }
-        }
-    };
-    CliArgs { command: Command::Config { action }, verbose }
-}
-
-fn parse_audit(args: &[String], verbose: bool) -> CliArgs {
-    let mut log_dir = None;
-    let mut format = AuditFormat::Text;
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--dir" | "-d" => { i += 1; if i < args.len() { log_dir = Some(PathBuf::from(&args[i])); } }
-            "--json" => { format = AuditFormat::Json; }
-            _ => {}
-        }
-        i += 1;
-    }
-    CliArgs { command: Command::Audit { log_dir, format }, verbose }
-}
-
-fn parse_serve(args: &[String], verbose: bool) -> CliArgs {
-    let port = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9800);
-    CliArgs { command: Command::Serve { port }, verbose }
 }
 
 fn print_usage() {

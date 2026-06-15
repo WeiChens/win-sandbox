@@ -19,18 +19,18 @@ TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
 HOST_EXE_RELEASE = PROJECT_ROOT / "target" / "release" / "sandbox-host.exe"
 HOST_EXE_DEBUG = PROJECT_ROOT / "target" / "debug" / "sandbox-host.exe"
+HOST_EXE_OUTPUT = PROJECT_ROOT / "output" / "sandbox-host.exe"
 CONFIG_DIR = TESTS_DIR / "configs"
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "default-sandbox.json"
 TEST_WORKDIR = TESTS_DIR / "workdir"
 
 
 def find_host_exe() -> Path:
-    """查找 sandbox-host.exe"""
-    if HOST_EXE_RELEASE.exists():
-        return HOST_EXE_RELEASE
-    if HOST_EXE_DEBUG.exists():
-        return HOST_EXE_DEBUG
-    return HOST_EXE_RELEASE  # 返回默认路径（后续报错）
+    """查找 sandbox-host.exe（优先 output/，其次 target/release/）"""
+    for p in [HOST_EXE_OUTPUT, HOST_EXE_RELEASE, HOST_EXE_DEBUG]:
+        if p.exists():
+            return p
+    return HOST_EXE_OUTPUT  # 返回默认路径（后续报错）
 
 
 HOST_EXE = find_host_exe()

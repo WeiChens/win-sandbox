@@ -6,6 +6,10 @@
       "permission": "inherit"
     },
     {
+      "pattern": "E:\\**",
+      "permission": "inherit"
+    },
+    {
       "pattern": "C:\\Windows\\**",
       "permission": "read_only"
     },

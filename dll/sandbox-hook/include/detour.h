@@ -11,6 +11,13 @@
 #define HOOK_PATCH_SIZE 32      // 最大 patch 大小
 #define JMP_SIZE        14      // x64: FF 25 + disp32 + addr (14 bytes)
 
+// x64 JMP 指令大小（mov rax,imm64 + jmp rax = 12 字节）
+#ifdef _M_IX86
+#define HOOK_MIN_PATCH 5
+#else
+#define HOOK_MIN_PATCH 12
+#endif
+
 /// Hook 上下文 — 跟踪已安装的 hook
 struct DetourContext {
     BYTE*   target = nullptr;           // 目标函数地址
