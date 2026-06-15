@@ -1,0 +1,46 @@
+{
+  "name": "test-net-port-deny",
+  "file_permissions": [
+    {
+      "pattern": "C:\\Users\\*\\**",
+      "permission": "inherit"
+    },
+    {
+      "pattern": "E:\\**",
+      "permission": "inherit"
+    },
+    {
+      "pattern": "C:\\Windows\\**",
+      "permission": "read_only"
+    }
+  ],
+  "network_permissions": [
+    {
+      "host": "127.0.0.1",
+      "port": 0,
+      "protocol": "any",
+      "action": "allow"
+    },
+    {
+      "host": "localhost",
+      "port": 0,
+      "protocol": "any",
+      "action": "allow"
+    },
+    {
+      "host": "*",
+      "port": 9999,
+      "protocol": "tcp",
+      "action": "deny"
+    },
+    {
+      "host": "*",
+      "port": 0,
+      "protocol": "tcp",
+      "action": "allow"
+    }
+  ],
+  "enable_network_isolation": true,
+  "enable_recursive_injection": false,
+  "audit_log_dir": ".\\sandbox-logs"
+}

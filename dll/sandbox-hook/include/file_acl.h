@@ -31,6 +31,11 @@ bool InitFileAcl(const std::string& json);
 /// @return 权限级别
 FilePermission CheckFilePermission(const std::wstring& path);
 
+/// 检查文件权限（含硬链接绕过检测）
+/// 除了检查 path 本身的权限，还会检查该文件的所有硬链接路径。
+/// 如果任一硬链接路径被拒绝，返回该权限（防御 mklink /H 绕过）。
+FilePermission CheckFilePermissionWithHardLinks(const std::wstring& path);
+
 /// ACL 是否已初始化
 bool IsAclInitialized();
 

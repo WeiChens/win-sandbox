@@ -63,6 +63,14 @@ typedef struct _MY_OBJECT_ATTRIBUTES {
 
 // NtCreateUserProcess flags
 #define CREATE_SUSPENDED_FLAG 0x00000004
+// NT Create disposition constants
+#define FILE_SUPERSEDE       0x00000000
+#define FILE_OPEN            0x00000001
+#define FILE_CREATE          0x00000002
+#define FILE_OPEN_IF         0x00000003
+#define FILE_OVERWRITE       0x00000004
+#define FILE_OVERWRITE_IF    0x00000005
+#define FILE_DIRECTORY_FILE  0x00000001
 
 // ============================================================================
 // 全局状态
@@ -480,8 +488,18 @@ static NTSTATUS WINAPI Hook_NtCreateFile(
             CreateDisposition, CreateOptions, EaBuffer, EaLength);
     }
 
-    // ACL 检查
-    FilePermission perm = IsAclInitialized() ? CheckFilePermission(pathStr) : FilePermission::Inherit;
+    // ACL 检查（新建文件无需硬链接检查，但打开已有文件需防硬链接绕过）
+    FilePermission perm;
+    if (IsAclInitialized()) {
+        // FILE_OPEN / FILE_OPEN_IF / FILE_SUPERSEDE / FILE_OVERWRITE / FILE_OVERWRITE_IF
+        // 都是操作已有文件，需要检查硬链接
+        bool existingFile = (CreateDisposition != FILE_CREATE);
+        perm = existingFile
+            ? CheckFilePermissionWithHardLinks(pathStr)
+            : CheckFilePermission(pathStr);
+    } else {
+        perm = FilePermission::Inherit;
+    }
 
     if (perm == FilePermission::Deny) {
         AuditLog(AuditEventType::FileDeny, pathStr, L"deny_create", DesiredAccess, STATUS_ACCESS_DENIED);
@@ -503,13 +521,7 @@ static NTSTATUS WINAPI Hook_NtCreateFile(
             return STATUS_ACCESS_DENIED;
         }
 
-        #define FILE_DIRECTORY_FILE  0x00000001
-        #define FILE_OPEN            0x00000001
-        #define FILE_CREATE          0x00000002
-        #define FILE_OPEN_IF         0x00000003
-        #define FILE_SUPERSEDE       0x00000000
-        #define FILE_OVERWRITE       0x00000004
-        #define FILE_OVERWRITE_IF    0x00000005
+
         if ((CreateOptions & FILE_DIRECTORY_FILE) &&
             (CreateDisposition == FILE_CREATE ||
              CreateDisposition == FILE_SUPERSEDE ||
@@ -550,7 +562,7 @@ static NTSTATUS WINAPI Hook_NtOpenFile(
                                IoStatusBlock, ShareAccess, OpenOptions);
     }
 
-    FilePermission perm = CheckFilePermission(pathStr);
+    FilePermission perm = CheckFilePermissionWithHardLinks(pathStr);
     if (perm == FilePermission::Deny) {
         AuditLog(AuditEventType::FileDeny, pathStr, L"deny_open", DesiredAccess, STATUS_ACCESS_DENIED);
         if (FileHandle) *FileHandle = nullptr;
@@ -569,7 +581,7 @@ static NTSTATUS WINAPI Hook_NtDeleteFile(PVOID ObjectAttributes) {
     wchar_t path[1024] = {0};
     if (ExtractPathFromOA(ObjectAttributes, path, 1024) && path[0]) {
         std::wstring pathStr(path);
-        FilePermission perm = CheckFilePermission(pathStr);
+        FilePermission perm = CheckFilePermissionWithHardLinks(pathStr);
         if (perm == FilePermission::Deny || perm == FilePermission::ReadOnly) {
             AuditLog(AuditEventType::FileDeny, pathStr, L"deny_delete", DELETE, STATUS_ACCESS_DENIED);
             SetLastError(ERROR_ACCESS_DENIED);
@@ -639,68 +651,98 @@ static NTSTATUS WINAPI Hook_NtSetInformationFile(
 {
     if (!Real_NtSetInformationFile) return STATUS_ACCESS_DENIED;
 
-    // ---- 重命名拦截 ----
-    if ((FileInformationClass == 10 || FileInformationClass == 66) && Length >= 20) {
-        BYTE* info = (BYTE*)FileInformation;
+    // ---- 解析目标路径（共用代码，用于重命名和硬链接） ----
+    auto resolveTargetPath = [&](wchar_t* outPath, size_t outSize) -> bool {
+        if (outSize == 0) return false;
+        outPath[0] = L'\0';
+        if (Length < 20) return false;
 
-        // FILE_RENAME_INFO 结构（x64 布局）:
-        //   [0]    BOOLEAN ReplaceIfExists  (1B) + padding (7B)
-        //   [8]    HANDLE  RootDirectory     (8B)
-        //   [16]   DWORD   FileNameLength    (4B)
-        //   [20]   WCHAR   FileName[]         (variable)
+        BYTE* info = (BYTE*)FileInformation;
 #ifdef _M_IX86
-        HANDLE renameRoot = *(HANDLE*)(info + 4);
-        DWORD nameLen = *(DWORD*)(info + 8);
+        HANDLE rootDir = *(HANDLE*)(info + 4);
+        DWORD nameLenBytes = *(DWORD*)(info + 8);
         WCHAR* fileName = (WCHAR*)(info + 12);
 #else
-        HANDLE renameRoot = *(HANDLE*)(info + 8);
-        DWORD nameLen = *(DWORD*)(info + 16);
+        HANDLE rootDir = *(HANDLE*)(info + 8);
+        DWORD nameLenBytes = *(DWORD*)(info + 16);
         WCHAR* fileName = (WCHAR*)(info + 20);
 #endif
-        if (nameLen > 0 && nameLen < 4096) {
-            wchar_t targetPath[1024] = {0};
-            size_t nameChars = nameLen / sizeof(WCHAR);
-            if (nameChars >= 1024) nameChars = 1023;
+        if (nameLenBytes == 0 || nameLenBytes >= 4096) return false;
+        size_t nameChars = nameLenBytes / sizeof(WCHAR);
+        if (nameChars >= outSize) nameChars = outSize - 1;
 
-            if (renameRoot && renameRoot != INVALID_HANDLE_VALUE) {
-                // 相对路径：RootDirectory + FileName
-                if (EnterGetPath()) {
-                    wchar_t dirPath[1024] = {0};
-                    if (GetFinalPathNameByHandleW(renameRoot, dirPath, 1024, 0) > 0) {
-                        int pos = (wcsncmp(dirPath, L"\\\\?\\", 4) == 0) ? 4 : 0;
-                        wchar_t* dirStart = dirPath + pos;
-                        size_t dirLen = wcslen(dirStart);
-                        if (dirLen > 0 && dirStart[dirLen - 1] != L'\\') {
-                            if (dirLen < 1023) { dirStart[dirLen] = L'\\'; dirStart[dirLen + 1] = L'\0'; }
-                        }
-                        wcsncpy_s(targetPath, 1024, dirStart, _TRUNCATE);
+        if (rootDir && rootDir != INVALID_HANDLE_VALUE) {
+            if (EnterGetPath()) {
+                wchar_t dirPath[1024] = {0};
+                if (GetFinalPathNameByHandleW(rootDir, dirPath, 1024, 0) > 0) {
+                    int pos = (wcsncmp(dirPath, L"\\\\?\\", 4) == 0) ? 4 : 0;
+                    wchar_t* dirStart = dirPath + pos;
+                    size_t dirLen = wcslen(dirStart);
+                    if (dirLen > 0 && dirStart[dirLen - 1] != L'\\') {
+                        if (dirLen < 1023) { dirStart[dirLen] = L'\\'; dirStart[dirLen + 1] = L'\0'; }
                     }
-                    LeaveGetPath();
+                    wcsncpy_s(outPath, outSize, dirStart, _TRUNCATE);
                 }
-                if (!targetPath[0]) {
-                    return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
-                        FileInformation, Length, FileInformationClass);
-                }
-                size_t baseLen = wcslen(targetPath);
-                size_t copyChars = nameChars;
-                if (baseLen + copyChars >= 1024) copyChars = 1024 - baseLen - 1;
-                wcsncpy_s(targetPath + baseLen, 1024 - baseLen, fileName, copyChars);
-                targetPath[baseLen + copyChars] = L'\0';
-            } else {
-                // 绝对路径
-                wcsncpy_s(targetPath, 1024, fileName, nameChars);
-                targetPath[nameChars] = L'\0';
-                // 去掉 \??\ 前缀
-                if (wcsncmp(targetPath, L"\\??\\", 4) == 0) {
-                    wcscpy_s(targetPath, 1024, targetPath + 4);
-                }
+                LeaveGetPath();
             }
+            if (!outPath[0]) return false;
+            size_t baseLen = wcslen(outPath);
+            size_t copyChars = nameChars;
+            if (baseLen + copyChars >= outSize) copyChars = outSize - baseLen - 1;
+            wcsncpy_s(outPath + baseLen, outSize - baseLen, fileName, copyChars);
+            outPath[baseLen + copyChars] = L'\0';
+        } else {
+            wcsncpy_s(outPath, outSize, fileName, nameChars);
+            outPath[nameChars] = L'\0';
+            if (wcsncmp(outPath, L"\\??\\", 4) == 0) {
+                wcscpy_s(outPath, outSize, outPath + 4);
+            }
+        }
 
-            if (targetPath[0]) {
-                std::transform(targetPath, targetPath + wcslen(targetPath), targetPath, ::towupper);
-                FilePermission perm = CheckFilePermission(targetPath);
-                if (perm == FilePermission::Deny || perm == FilePermission::ReadOnly) {
-                    AuditLog(AuditEventType::FileDeny, targetPath, L"deny_rename",
+        if (outPath[0]) {
+            std::transform(outPath, outPath + wcslen(outPath), outPath, ::towupper);
+            return true;
+        }
+        return false;
+    };
+
+    // ---- 重命名拦截 (FileRenameInformation = 10, FileRenameInformationEx = 66) ----
+    if (FileInformationClass == 10 || FileInformationClass == 66) {
+        wchar_t targetPath[1024] = {0};
+        if (resolveTargetPath(targetPath, 1024)) {
+            FilePermission perm = CheckFilePermission(targetPath);
+            if (perm == FilePermission::Deny || perm == FilePermission::ReadOnly) {
+                AuditLog(AuditEventType::FileDeny, targetPath, L"deny_rename",
+                         0, STATUS_ACCESS_DENIED);
+                SetLastError(ERROR_ACCESS_DENIED);
+                return STATUS_ACCESS_DENIED;
+            }
+        }
+    }
+
+    // ---- 硬链接创建拦截 (FileLinkInformation = 11) ----
+    // mklink /H C:\Public\link.txt C:\Secret\file.txt
+    // 检查目标文件路径（C:\Secret\file.txt）是否被拒绝
+    if (FileInformationClass == 11) {
+        wchar_t targetPath[1024] = {0};
+        if (resolveTargetPath(targetPath, 1024)) {
+            // 还要检查源文件（已打开的文件句柄）是否有硬链接在拒绝路径
+            wchar_t srcPath[1024] = {0};
+            if (GetPathFromHandle(FileHandle, srcPath, 1024) && srcPath[0]) {
+                // 检查目标路径（新硬链接的位置）
+                FilePermission targetPerm = CheckFilePermission(targetPath);
+                if (targetPerm == FilePermission::Deny || targetPerm == FilePermission::ReadOnly) {
+                    AuditLog(AuditEventType::FileDeny, targetPath, L"deny_link_target",
+                             0, STATUS_ACCESS_DENIED);
+                    SetLastError(ERROR_ACCESS_DENIED);
+                    return STATUS_ACCESS_DENIED;
+                }
+
+                // 检查源文件的所有硬链接（已有数据的位置）
+                // 如果任一硬链接在拒绝路径，也不允许创建新链接到可访问路径
+                FilePermission srcPerm = CheckFilePermissionWithHardLinks(srcPath);
+                if (srcPerm == FilePermission::Deny || srcPerm == FilePermission::ReadOnly) {
+                    AuditLog(AuditEventType::FileDeny, targetPath, L"deny_link_src_hardlink",
                              0, STATUS_ACCESS_DENIED);
                     SetLastError(ERROR_ACCESS_DENIED);
                     return STATUS_ACCESS_DENIED;
@@ -709,12 +751,12 @@ static NTSTATUS WINAPI Hook_NtSetInformationFile(
         }
     }
 
-    // ---- 标记删除拦截 ----
+    // ---- 标记删除拦截 (FileDispositionInformation = 13) ----
     if (FileInformationClass == 13 && Length >= 1) {
         if (*(BYTE*)FileInformation) {  // DeleteFile = TRUE
             wchar_t path[1024] = {0};
             if (GetPathFromHandle(FileHandle, path, 1024) && path[0]) {
-                FilePermission perm = CheckFilePermission(path);
+                FilePermission perm = CheckFilePermissionWithHardLinks(path);
                 if (perm == FilePermission::Deny || perm == FilePermission::ReadOnly) {
                     AuditLog(AuditEventType::FileDeny, path, L"deny_delete_via_setinfo",
                              0, STATUS_ACCESS_DENIED);

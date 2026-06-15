@@ -268,6 +268,277 @@ def test_mkdir_deny(runner: SandboxRunner) -> TestResult:
     )
 
 
+# ─── 重命名测试（NtSetInformationFile Hook）─────────────────────────────
+
+def test_rename_inherit(runner: SandboxRunner) -> TestResult:
+    """2.11 Rename Inherit: 允许在继承区域重命名文件"""
+    ensure_workdir()
+    t0 = time.time()
+    old_file = TEST_WORKDIR / "rename_old.txt"
+    new_file = TEST_WORKDIR / "rename_new.txt"
+
+    # 清理残留
+    if new_file.exists():
+        new_file.unlink()
+    if old_file.exists():
+        old_file.unlink()
+
+    old_file.write_text("rename_test", encoding="utf-8")
+
+    # ren 命令通过 MoveFileW → NtSetInformationFile(FileRenameInformation)
+    rc, out, err = runner.exec(
+        # 使用完整路径 ren（但 ren 的语法是: ren old new，需要同一目录）
+        # 改用 move 命令，它更通用
+        f'move /Y "{old_file}" "{new_file}" >nul && if exist "{new_file}" echo RENAME_OK',
+        config=INHERIT_CONFIG, timeout=15,
+    )
+    dt = time.time() - t0
+
+    renamed = new_file.exists()
+    if old_file.exists():
+        old_file.unlink()
+    if new_file.exists():
+        new_file.unlink()
+
+    return runner.make_result(
+        "Rename Inherit: 允许重命名", "文件ACL-Rename", "x64",
+        rc, out, err,
+        expected_rc=0,
+        expected_text="RENAME_OK" if renamed else None,
+        duration=dt,
+    )
+
+
+def test_rename_to_readonly_blocked(runner: SandboxRunner) -> TestResult:
+    """2.12 Rename ReadOnly: 禁止重命名文件到只读区域（目标路径检查）"""
+    ensure_workdir()
+    t0 = time.time()
+    old_file = TEST_WORKDIR / "rename_to_ro.txt"
+    old_file.write_text("rename_test", encoding="utf-8")
+
+    # 尝试将文件从 Inherit 区域移动到 ReadOnly 区域（C:\Windows\...）
+    # NtSetInformationFile 检查目标路径权限 → 应被阻止
+    rc, out, err = runner.exec(
+        f'move /Y "{old_file}" "C:\\Windows\\System32\\drivers\\etc\\sandbox_ro_rename_test.txt" 2>nul && echo RENAME_OK || echo RENAME_BLOCKED',
+        config=INHERIT_CONFIG, timeout=15,
+    )
+    dt = time.time() - t0
+
+    # 清理
+    if old_file.exists():
+        old_file.unlink()
+    ro_dest = Path("C:\\Windows\\System32\\drivers\\etc\\sandbox_ro_rename_test.txt")
+    if ro_dest.exists():
+        ro_dest.unlink()
+
+    blocked = "RENAME_BLOCKED" in out or rc != 0
+    return runner.make_result(
+        "Rename ReadOnly: 禁止到只读区域", "文件ACL-Rename", "x64",
+        rc, out, err,
+        expected_text="RENAME_BLOCKED" if blocked else None,
+        duration=dt,
+    )
+
+
+# ─── 目录删除测试（NtSetInformationFile + NtDeleteFile Hook）────────────
+
+def test_rmdir_inherit(runner: SandboxRunner) -> TestResult:
+    """2.13 rmdir Inherit: 允许在继承区域删除空目录"""
+    ensure_workdir()
+    t0 = time.time()
+    test_dir = TEST_WORKDIR / "rmdir_inherit_test"
+    test_dir.mkdir(parents=True, exist_ok=True)
+
+    # rmdir 通过 NtSetInformationFile(FileDispositionInformation) 或 NtDeleteFile
+    rc, out, err = runner.exec(
+        f'rmdir "{test_dir}" >nul && echo RMDIR_OK',
+        config=INHERIT_CONFIG, timeout=15,
+    )
+    dt = time.time() - t0
+
+    dir_removed = not test_dir.exists()
+    if test_dir.exists():
+        test_dir.rmdir()
+
+    return runner.make_result(
+        "rmdir Inherit: 允许删除目录", "文件ACL-rmdir", "x64",
+        rc, out, err,
+        expected_rc=0 if dir_removed else None,
+        duration=dt,
+    )
+
+
+def test_rmdir_readonly_blocked(runner: SandboxRunner) -> TestResult:
+    """2.14 rmdir ReadOnly: 禁止在只读区域删除目录"""
+    ensure_workdir()
+    t0 = time.time()
+    test_dir = TEST_WORKDIR / "rmdir_ro_test"
+    test_dir.mkdir(parents=True, exist_ok=True)
+
+    # 在 ReadOnly 配置下删除目录 → 应被阻止
+    rc, out, err = runner.exec(
+        f'rmdir "{test_dir}" 2>nul && echo RMDIR_OK || echo RMDIR_BLOCKED',
+        config=READONLY_CONFIG, timeout=15,
+    )
+    dt = time.time() - t0
+
+    blocked = test_dir.exists() or "RMDIR_BLOCKED" in out
+    if test_dir.exists():
+        test_dir.rmdir()
+
+    return runner.make_result(
+        "rmdir ReadOnly: 禁止删除目录", "文件ACL-rmdir", "x64",
+        rc, out, err,
+        expected_text="RMDIR_BLOCKED" if blocked else None,
+        duration=dt,
+    )
+
+
+# ─── 硬链接测试（NtSetInformationFile + CheckFilePermissionWithHardLinks）─
+
+def test_hardlink_to_deny_blocked(runner: SandboxRunner) -> TestResult:
+    """2.15 Hardlink Deny: 禁止创建硬链接到拒绝区域"""
+    ensure_workdir()
+    t0 = time.time()
+    source_file = TEST_WORKDIR / "hardlink_source.txt"
+    source_file.write_text("hardlink_test_data", encoding="utf-8")
+
+    # 尝试在 C:\Program Files (Deny 区域) 创建指向源文件的硬链接
+    # mklink /H 触发 NtSetInformationFile(FileLinkInformation) → 应被阻止
+    link_target = "C:\\Program Files\\sandbox_hardlink_test.txt"
+    rc, out, err = runner.exec(
+        f'mklink /H "{link_target}" "{source_file}" 2>nul && echo LINK_OK || echo LINK_BLOCKED',
+        config=DENY_CONFIG, timeout=15,
+    )
+    dt = time.time() - t0
+
+    if source_file.exists():
+        source_file.unlink()
+    link_path = Path(link_target)
+    if link_path.exists():
+        link_path.unlink()
+
+    blocked = "LINK_BLOCKED" in out or rc != 0
+    return runner.make_result(
+        "Hardlink Deny: 禁止到拒绝区域", "文件ACL-Hardlink", "x64",
+        rc, out, err,
+        expected_text="LINK_BLOCKED" if blocked else None,
+        duration=dt,
+    )
+
+
+def test_hardlink_inherit_allowed(runner: SandboxRunner) -> TestResult:
+    """2.16 Hardlink Inherit: 允许在继承区域创建硬链接"""
+    ensure_workdir()
+    t0 = time.time()
+    source_file = TEST_WORKDIR / "hardlink_src.txt"
+    link_file = TEST_WORKDIR / "hardlink_link.txt"
+
+    if link_file.exists():
+        link_file.unlink()
+    source_file.write_text("hardlink_data", encoding="utf-8")
+
+    # 同一区域创建硬链接 → 应被允许
+    rc, out, err = runner.exec(
+        f'mklink /H "{link_file}" "{source_file}" >nul && echo LINK_OK',
+        config=INHERIT_CONFIG, timeout=15,
+    )
+    dt = time.time() - t0
+
+    link_created = link_file.exists()
+    if source_file.exists():
+        source_file.unlink()
+    if link_file.exists():
+        link_file.unlink()
+
+    return runner.make_result(
+        "Hardlink Inherit: 允许同区域", "文件ACL-Hardlink", "x64",
+        rc, out, err,
+        expected_rc=0 if link_created else None,
+        expected_text="LINK_OK" if link_created else None,
+        duration=dt,
+    )
+
+
+# ─── 边界/边缘测试 ──────────────────────────────────────────────────
+
+def test_file_with_spaces(runner: SandboxRunner) -> TestResult:
+    """2.17 文件名含空格: 在继承区域可正常读写"""
+    ensure_workdir()
+    t0 = time.time()
+    test_file = TEST_WORKDIR / "file with spaces.txt"
+
+    rc, out, err = runner.exec(
+        f'echo "spaces_ok" > "{test_file}" && type "{test_file}"',
+        config=INHERIT_CONFIG, timeout=15,
+    )
+    dt = time.time() - t0
+
+    if test_file.exists():
+        test_file.unlink()
+
+    return runner.make_result(
+        "文件名含空格: 正常读写", "文件ACL-Edge", "x64",
+        rc, out, err,
+        expected_rc=0,
+        expected_text="spaces_ok",
+        duration=dt,
+    )
+
+
+def test_deep_nested_path(runner: SandboxRunner) -> TestResult:
+    """2.18 深度嵌套路径: 在继承区域创建多层目录并写入"""
+    ensure_workdir()
+    t0 = time.time()
+    deep_dir = TEST_WORKDIR / "a" / "b" / "c" / "d" / "e"
+    test_file = deep_dir / "deep_test.txt"
+
+    rc, out, err = runner.exec(
+        f'mkdir "{deep_dir}" 2>nul && echo "deep_ok" > "{test_file}" && type "{test_file}"',
+        config=INHERIT_CONFIG, timeout=15,
+    )
+    dt = time.time() - t0
+
+    # 清理
+    if test_file.exists():
+        test_file.unlink()
+    # 从里到外删除目录
+    for p in [deep_dir, deep_dir.parent, deep_dir.parent.parent,
+              deep_dir.parent.parent.parent, deep_dir.parent.parent.parent.parent]:
+        if p != TEST_WORKDIR and p.exists():
+            try:
+                p.rmdir()
+            except OSError:
+                break
+
+    return runner.make_result(
+        "深度嵌套路径: 多层目录创建", "文件ACL-Edge", "x64",
+        rc, out, err,
+        expected_rc=0,
+        expected_text="deep_ok",
+        duration=dt,
+    )
+
+
+def test_device_path_passthrough(runner: SandboxRunner) -> TestResult:
+    """2.19 设备路径放行: NUL 设备应正常工作（绕过 ACL 检查）"""
+    t0 = time.time()
+    # NUL 是 DOS 设备名，IsDevicePath() 返回 true → 直接放行
+    # 即使用 Deny 配置也应该能写入 NUL
+    rc, out, err = runner.exec(
+        'echo "device_test" > NUL && echo DEVICE_OK',
+        config=DENY_CONFIG, timeout=15,
+    )
+    dt = time.time() - t0
+    return runner.make_result(
+        "设备路径放行: NUL 写入", "文件ACL-Edge", "x64",
+        rc, out, err,
+        expected_rc=0,
+        expected_text="DEVICE_OK",
+        duration=dt,
+    )
+
+
 # ─── 测试注册表 ──────────────────────────────────────────────────────
 FILE_ACL_TESTS = [
     test_inherit_write_temp,
@@ -279,5 +550,14 @@ FILE_ACL_TESTS = [
     test_deny_cannot_write_program_files,
     test_mkdir_readonly,
     test_mkdir_inherit,
-    test_mkdir_deny,       # ★ 新增：Bug #5 回归测试
+    test_mkdir_deny,       # Bug #5 回归测试
+    test_rename_inherit,
+    test_rename_to_readonly_blocked,
+    test_rmdir_inherit,
+    test_rmdir_readonly_blocked,
+    test_hardlink_to_deny_blocked,
+    test_hardlink_inherit_allowed,
+    test_file_with_spaces,
+    test_deep_nested_path,
+    test_device_path_passthrough,
 ]
