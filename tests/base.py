@@ -71,7 +71,7 @@ class TestResult:
         extra = ""
         if self.skip:
             extra = f" (跳过: {self.skip_reason})"
-        elif self.known_fail:
+        elif not self.passed and self.known_fail:
             extra = " (已知失败)"
         return f"{self.status_icon} [{self.arch}] {self.name}{extra}"
 
@@ -142,7 +142,7 @@ class TestSuite:
         total = len(self.results)
         passed = sum(1 for r in self.results if r.passed)
         failed = sum(1 for r in self.results if not r.passed and not r.known_fail and not r.skip)
-        known = sum(1 for r in self.results if r.known_fail)
+        known = sum(1 for r in self.results if not r.passed and r.known_fail)
         skipped = sum(1 for r in self.results if r.skip)
 
         print(f"\n{'='*60}")

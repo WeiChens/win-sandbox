@@ -39,7 +39,11 @@ set(DETOURS_SOURCES
 set(SOURCES
     src/dllmain.cpp
     src/detour.cpp
-    src/hook_engine.cpp
+    src/hook_engine.cpp       # 编排器：Init/InstallAll/UninstallAll
+    src/hook_file.cpp         # 文件 Hook：NtCreate/Open/Delete/SetInfo/WriteFile
+    src/hook_process.cpp      # 进程 Hook：NtCreateUserProcess/ResumeThread + SelfInject
+    src/hook_crash.cpp        # 崩溃处理：VEH + CorExitProcess 等
+    src/path_resolver.cpp     # 路径解析：NtQueryObject + GetFinalPathNameByHandleW
     src/file_acl.cpp
     src/net_acl.cpp
     src/ipc_client.cpp

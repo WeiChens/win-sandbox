@@ -260,6 +260,56 @@ static int RelocateInstruction(BYTE* dst, BYTE* src, BYTE* trampoline, BYTE* tar
     int opcode_len = (src[prefix_len] == 0x0F) ? 2 : 1;
     BYTE b = src[prefix_len + opcode_len - 1];
     BYTE prev = (opcode_len >= 2) ? src[prefix_len] : 0;
+
+    // ★ x64 CALL (0xE8) / JMP (0xE9) 重定位
+    //   这些指令没有 ModRM，但包含相对偏移，需要在跳板中重新计算
+    if (b == 0xE8 || b == 0xE9) {
+        // 确认完整指令长度 (E8/E9 + rel32 = 5 bytes)
+        if (total_len < 5) return 0;
+        // 原始目标地址 = src + 5 + old_offset
+        int old_offset = *(int*)(src + prefix_len + opcode_len);
+        BYTE* orig_target = src + total_len + old_offset;
+        // 新目标地址相对跳板位置重新计算
+        BYTE* new_pos = dst + total_len;
+        int new_offset = (int)(orig_target - new_pos);
+        // 拷贝指令（前缀+opcode）
+        for (int i = 0; i < prefix_len + opcode_len; i++)
+            dst[i] = src[i];
+        // 写入新偏移
+        *(int*)(dst + prefix_len + opcode_len) = new_offset;
+        return total_len;
+    }
+
+    // ★ x64 条件跳转 (0F 8x — rel32) 重定位
+    if (prev == 0x0F && b >= 0x80 && b <= 0x8F) {
+        if (total_len < 6) return 0;
+        int old_offset = *(int*)(src + prefix_len + 2);  // 0F 8x + rel32
+        BYTE* orig_target = src + total_len + old_offset;
+        BYTE* new_pos = dst + total_len;
+        int new_offset = (int)(orig_target - new_pos);
+        for (int i = 0; i < prefix_len + 2; i++)
+            dst[i] = src[i];
+        *(int*)(dst + prefix_len + 2) = new_offset;
+        return total_len;
+    }
+
+    // ★ x64 短跳转 (EB — rel8, 70-7F — 条件 rel8) 重定位
+    if (b == 0xEB || (b >= 0x70 && b <= 0x7F)) {
+        if (total_len < 2) return 0;
+        signed char old_offset = *(signed char*)(src + prefix_len + opcode_len);
+        BYTE* orig_target = src + total_len + old_offset;
+        BYTE* new_pos = dst + total_len;
+        int new_offset = (int)(orig_target - new_pos);
+        if (new_offset >= -128 && new_offset <= 127) {
+            for (int i = 0; i < prefix_len + opcode_len; i++)
+                dst[i] = src[i];
+            dst[prefix_len + opcode_len] = (BYTE)(signed char)new_offset;
+            return total_len;
+        }
+        // 偏移超出短跳范围，无法重定位 → 让调用者原始拷贝
+        return 0;
+    }
+
     if (!OpcodeHasModrm(b, prev)) return 0;
 
     int modrm_offset = prefix_len + opcode_len;

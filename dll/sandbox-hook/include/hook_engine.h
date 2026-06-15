@@ -1,16 +1,31 @@
-// hook_engine.h — Hook 管理器 + 自注入引擎
+// hook_engine.h — Hook 管理器 + 自注入引擎（拆分后的公共接口）
 //
 // ★ 核心架构改进（vs Failure-01）：
 //   递归注入在 C++ DLL 内部直接完成，不再通过 IPC 到 Rust Host。
 //   Hook_NtResumeThread → OpenProcess → VirtualAllocEx →
 //   WriteProcessMemory → CreateRemoteThread(LoadLibraryW) → ResumeThread
 //   全部在同一调用栈完成，耗时 <100μs，CLR 不会检测到。
+//
+// ★ 文件拆分 (1379→5文件)：
+//   hook_engine.cpp    — 编排器：Init/InstallAll/UninstallAll/SignalInitComplete
+//   path_resolver.cpp  — TLS守卫 + GetPathFromHandle + GetPathFromHandleNt
+//   hook_file.cpp      — NtCreate/NtOpen/NtDelete/NtSetInfo/NtWriteFile + Install
+//   hook_process.cpp   — NtCreateUserProcess/NtResumeThread/SelfInject + TrackedProcess
+//   hook_crash.cpp     — VEH + CorExitProcess + SetUnhandledExceptionFilter
 
 #pragma once
 #include <windows.h>
 #include <cstdint>
 #include <vector>
 #include <string>
+#include <atomic>
+
+// ============================================================================
+// 共享全局变量（在 hook_engine.cpp 中定义，其他 .cpp 通过 extern 访问）
+// ============================================================================
+
+/// DLL 正在卸载标志（VEH 和 NtResumeThread 检查此标志避免操作已释放内存）
+extern std::atomic<bool> g_dll_detaching;
 
 // ============================================================================
 // 进程追踪
@@ -27,8 +42,18 @@ struct TrackedProcess {
     HANDLE  hInitEvent = nullptr;
 };
 
+/// 追踪记录列表 + 关键区（在 hook_process.cpp 中定义）
+extern std::vector<TrackedProcess> g_tracked;
+extern CRITICAL_SECTION g_track_cs;
+
+/// 在追踪列表中查找指定线程
+TrackedProcess* FindByThread(HANDLE hThread);
+
+/// 清理追踪记录
+void ClearTracked(TrackedProcess* tp);
+
 // ============================================================================
-// Hook 引擎
+// Hook 引擎（编排器）
 // ============================================================================
 
 /// 初始化 Hook 引擎（在 DllMain DLL_PROCESS_ATTACH 调用）
@@ -47,21 +72,13 @@ void UninstallAllHooks();
 void SignalInitComplete();
 
 // ============================================================================
-// 自注入引擎（关键路径！）
+// 自注入引擎（hook_process.cpp）
 // ============================================================================
 
 /// 直接将沙箱 DLL 注入目标进程（同进程直投，无 IPC）
-/// 自动检测目标架构（x64/x86 WOW64）并选择正确 DLL
-/// @param pid       目标进程 PID
-/// @param hProcess  目标进程句柄（可选，nullptr 则内部 OpenProcess）
-/// @param hThread   目标主线程句柄（用于获取架构信息）
-/// @return 成功返回 true
 bool SelfInject(DWORD pid, HANDLE hProcess, HANDLE hThread);
 
 /// 获取 32 位 kernel32!LoadLibraryW 地址（用于 WOW64 注入）
-/// 通过创建辅助 32 位进程 + ToolHelp 快照 + ReadProcessMemory 实现
-/// 结果被缓存，同一启动会话内地址不变
-/// @return 32位 LoadLibraryW 地址，失败返回 0
 uint32_t GetWow64LoadLibraryW();
 
 /// 检测当前进程是否加载了 .NET CLR
@@ -70,7 +87,42 @@ bool IsClrLoaded();
 /// 获取当前 DLL 路径
 std::wstring GetCurrentDllPath();
 
-/// 获取指定架构的 DLL 路径（x64 或 x86）
-/// @param isWow64  true = 返回 x86 路径，false = 返回 x64 路径
+/// 获取指定架构的 DLL 路径
 std::wstring GetDllPathForArch(bool isWow64);
 
+/// DLL 路径缓存（在 hook_process.cpp 中定义）
+extern std::wstring g_dllPathX64;
+extern std::wstring g_dllPathX86;
+extern std::wstring g_dllPathSelf;
+
+// ============================================================================
+// 路径解析（path_resolver.cpp）
+// ============================================================================
+
+/// 从 HANDLE 获取文件路径（旧方案，GetFinalPathNameByHandleW，带 TLS 守卫）
+/// 失败返回 false
+bool GetPathFromHandle(HANDLE hFile, wchar_t* out, size_t outSize);
+
+/// 从 HANDLE 获取文件路径（新方案，NtQueryObject，无递归风险，<1μs）
+/// 失败返回 false
+bool GetPathFromHandleNt(HANDLE hFile, wchar_t* out, size_t outSize);
+
+// ============================================================================
+// 各 Hook 的安装函数（在各自文件中定义）
+// ============================================================================
+
+void InstallNtCreateFileHook();
+void InstallNtOpenFileHook();
+void InstallNtDeleteFileHook();
+void InstallNtSetInformationFileHook();
+void InstallNtWriteFileHook();
+void InstallNtCreateUserProcessHook();
+void InstallNtResumeThreadHook();
+void InstallNetHooks();         // 在 net_acl.cpp 中定义
+
+// ============================================================================
+// 崩溃处理（hook_crash.cpp）
+// ============================================================================
+
+/// 注册 VEH 向量化异常处理器（在 InitHookEngine 中调用）
+void InstallVehHandler();
