@@ -353,23 +353,38 @@ PowerShell 是 CLR 宿主，与内联 Hook 有几个冲突点：
 ## 测试
 
 ```powershell
-# 运行测试套件（全 45 个测试）
+# 运行全部测试（68 项）
 cd win-sandbox
-python test_all.py
+python tests/test_all.py
 
-# 单个测试模块
-python -m pytest test_file_acl.py -v
-python -m pytest test_network.py -v
+# 特定模块
+python tests/test_all.py --security          # 安全边界 (7.x)
+python tests/test_all.py --path              # 路径健壮性 (8.x)
+python tests/test_all.py --config-edge       # 配置极端 (9.x)
+python tests/test_all.py --quick             # 仅基础功能
+python tests/test_all.py --x64               # 仅 x64 相关
+python tests/test_all.py --x86               # 仅 x86 相关
+
+# 指定 pytest 运行特定模块
+python -m pytest tests/test_file_acl.py -v
+python -m pytest tests/test_network.py -v
+python -m pytest tests/test_edge.py -v
 ```
 
 ### 测试覆盖
 
 | 类别 | 数量 | 覆盖范围 |
 |------|------|---------|
-| 文件 ACL | 19个 | 创建/写入/删除/重命名/硬链接/ReadOnly/Deny/深度路径/设备路径 |
-| 网络 ACL | 3个 | DNS 拒绝/端口拒绝/非拒绝端口放行 |
-| 架构兼容 | 2个 | x86 ReadOnly/x64→x86 跨架构注入 |
-| 其他 | 21个 | 创建文件/目录/写入/读取/删除/递归注入等 |
+| **1. 基础功能** | 8 | cmd echo/whoami/dir, 退出码, stderr, 环境变量, PowerShell |
+| **2. 文件 ACL** | 19 | Inherit/ReadOnly/Deny 下的写入/删除/读取/mkdir/rmdir/重命名/硬链接, 空格路径/深度嵌套/设备路径 |
+| **3. 网络 ACL** | 8 | ping/nslookup/curl, TCP 拒绝, DNS 拒绝/允许, 端口级屏蔽 |
+| **4. 递归注入** | 5 | 2层/3层/5层嵌套, 跨架构 x64→x86, 递归禁用 |
+| **5. x86/WOW64** | 5 | 基础命令, 文件写入, ReadOnly 写入拦截 |
+| **6. AI API** | 4 | /health, POST /exec, 退出码, /audit |
+| **7. 安全边界 🔴** | 4 | NtOpenFile+ReadOnly 回归, FILE_DELETE_ON_CLOSE+Deny 回归, 多硬链接防护, 符号链接防护 |
+| **8. 路径健壮性** | 4 | 中文/日文 Unicode 路径, 超长路径 >200 字符, 备用数据流 (ADS) |
+| **9. 配置极端** | 9 | 超时终止, 不存在/空命令, 禁用递归, 5 层深度递归, IPv6, 100 次快速创建删除, 空规则列表, Deny 深层目录 |
+| **总计** | **68** | **全场景覆盖** |
 
 ---
 

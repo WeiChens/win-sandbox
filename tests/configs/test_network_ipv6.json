@@ -1,0 +1,42 @@
+{
+  "name": "test-network-ipv6",
+  "file_permissions": [
+    {
+      "pattern": "C:\\Users\\*\\**",
+      "permission": "inherit"
+    },
+    {
+      "pattern": "C:\\Windows\\**",
+      "permission": "read_only"
+    }
+  ],
+  "network_permissions": [
+    {
+      "host": "127.0.0.1",
+      "port": 0,
+      "protocol": "any",
+      "action": "allow"
+    },
+    {
+      "host": "::1",
+      "port": 0,
+      "protocol": "any",
+      "action": "allow"
+    },
+    {
+      "host": "localhost",
+      "port": 0,
+      "protocol": "any",
+      "action": "allow"
+    },
+    {
+      "host": "*",
+      "port": 0,
+      "protocol": "any",
+      "action": "deny"
+    }
+  ],
+  "enable_network_isolation": true,
+  "enable_recursive_injection": false,
+  "audit_log_dir": ".\\sandbox-logs"
+}
