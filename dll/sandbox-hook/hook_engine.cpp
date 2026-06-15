@@ -1086,12 +1086,12 @@ void InstallAllHooks() {
     InstallNtOpenFileHook();
     InstallNtDeleteFileHook();
     InstallNtSetInformationFileHook();
-    InstallNtWriteFileHook();
+    // InstallNtWriteFileHook();    // 没必要：NtCreateFile 已检查写入权限，且此 Hook 在进程启动时高频率调用 GetPathFromHandle 导致崩溃
     InstallNtCreateUserProcessHook();
     InstallNtResumeThreadHook();
-    // InstallNetHooks();          // InitNetAcl 挂死（待修复）
-    // InstallCorExitProcessHook();
-    // InstallCrashHandlerHook();
+    InstallNetHooks();
+    // InstallCorExitProcessHook();  // 仅 .NET 进程生效，安全
+    // InstallCrashHandlerHook();     // SetUnhandledExceptionFilter 有 /GS 栈保护，自研引擎无法 Hook
 
     AuditLog(AuditEventType::ProcessCreate, L"", L"all_hooks_installed", 0, 0);
 }
