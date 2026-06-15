@@ -87,7 +87,7 @@ def test_recursive_pwsh_nested(runner: SandboxRunner) -> TestResult:
 
 
 def test_recursive_x86_nested(runner: SandboxRunner) -> TestResult:
-    """4.5 递归注入: x64→x86 跨架构注入"""
+    """4.5 递归注入: x64→x86 跨架构注入（使用 sandbox_helper_x86）"""
     t0 = time.time()
     rc, out, err = runner.exec_direct(
         "C:\\Windows\\SysWOW64\\cmd.exe",
@@ -95,15 +95,18 @@ def test_recursive_x86_nested(runner: SandboxRunner) -> TestResult:
         config=INHERIT_CONFIG, timeout=30,
     )
     dt = time.time() - t0
-    passed = rc == 0 and "WOW64_NESTED_OK" in out
-    return runner.make_result(
+    # ★ x86 注入已修复，应正常工作
+    result = runner.make_result(
         "递归注入: x64→x86 跨架构", "递归注入", "x86",
         rc, out, err,
         expected_rc=0,
-        expected_text="WOW64_NESTED_OK" if passed else None,
-        known_fail=not passed,
+        expected_text="WOW64_NESTED_OK",
         duration=dt,
     )
+    if result.passed and not (rc == 0 and "WOW64_NESTED_OK" in out):
+        result.passed = False
+        result.error = "x86 跨架构注入失败"
+    return result
 
 
 # ─── 测试注册表 ──────────────────────────────────────────────────────

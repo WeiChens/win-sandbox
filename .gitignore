@@ -4,5 +4,5 @@ build-x64
 build-x86
 **/*.pyc
 **/*.log
-
+build
 output

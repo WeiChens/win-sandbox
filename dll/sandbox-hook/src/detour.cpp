@@ -248,6 +248,7 @@ static int RelocateInstruction(BYTE* dst, BYTE* src, BYTE* trampoline, BYTE* tar
     int total_len = GetInstructionLen(src);
     if (total_len <= 0) return 0;
 
+    // 跳过前缀
     int prefix_len = 0;
     while (src[prefix_len] == 0xF0 || src[prefix_len] == 0xF2 || src[prefix_len] == 0xF3 ||
            src[prefix_len] == 0x2E || src[prefix_len] == 0x36 || src[prefix_len] == 0x3E ||
@@ -256,6 +257,22 @@ static int RelocateInstruction(BYTE* dst, BYTE* src, BYTE* trampoline, BYTE* tar
         prefix_len++;
     }
     if ((src[prefix_len] & 0xF0) == 0x40) prefix_len++;
+
+    // ★ CALL rel32 (E8) / JMP rel32 (E9) — 需要在跳板中重定位
+    //   这些指令在 /GS 函数中用于调用 __security_cookie
+    BYTE op0 = src[prefix_len];
+    if (op0 == 0xE8 || op0 == 0xE9) {
+        if (total_len < 5) return 0;
+        int rel_offset = *(int*)(src + prefix_len + 1);
+        BYTE* orig_target = src + prefix_len + 5 + rel_offset;
+        BYTE* new_dst = dst + prefix_len + 5;
+        int new_offset = (int)(orig_target - new_dst);
+
+        for (int i = 0; i < prefix_len; i++) dst[i] = src[i];
+        dst[prefix_len] = op0;  // E8 or E9
+        *(int*)(dst + prefix_len + 1) = new_offset;
+        return prefix_len + 5;
+    }
 
     int opcode_len = (src[prefix_len] == 0x0F) ? 2 : 1;
     BYTE b = src[prefix_len + opcode_len - 1];

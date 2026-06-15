@@ -102,12 +102,17 @@ def test_readonly_cannot_write(runner: SandboxRunner) -> TestResult:
 
     # ReadOnly 应该阻止写入 → 内容保持 "original"
     blocked = "WRITE_BLOCKED" in out or content == "original"
-    return runner.make_result(
+    result = runner.make_result(
         "ReadOnly: 禁止写入", "文件ACL-ReadOnly", "x64",
         rc, out, err,
-        expected_text="WRITE_BLOCKED" if blocked else None,
+        expected_text="WRITE_BLOCKED",
         duration=dt,
     )
+    # 双重验证：文件内容也应未被修改
+    if result.passed and not blocked:
+        result.passed = False
+        result.error = "输出中未找到 WRITE_BLOCKED 且文件内容已被修改"
+    return result
 
 
 def test_readonly_cannot_delete(runner: SandboxRunner) -> TestResult:
@@ -123,18 +128,22 @@ def test_readonly_cannot_delete(runner: SandboxRunner) -> TestResult:
     )
     dt = time.time() - t0
 
+    # ★ cmd.exe 的 del 即使删除失败也返回 0，所以不能依赖 || 分支
+    #   必须以文件是否仍然存在作为判断依据
     file_still_exists = test_file.exists()
     if test_file.exists():
         test_file.unlink()
 
     # ReadOnly 应该阻止删除 → 文件仍存在
-    blocked = "DELETE_BLOCKED" in out or file_still_exists
-    return runner.make_result(
+    result = runner.make_result(
         "ReadOnly: 禁止删除", "文件ACL-ReadOnly", "x64",
         rc, out, err,
-        expected_text="DELETE_BLOCKED" if blocked else None,
         duration=dt,
     )
+    if not file_still_exists:
+        result.passed = False
+        result.error = "文件已被删除（沙箱未阻止删除）"
+    return result
 
 
 def test_readonly_can_read(runner: SandboxRunner) -> TestResult:
@@ -165,12 +174,11 @@ def test_deny_cannot_access(runner: SandboxRunner) -> TestResult:
         config=DENY_CONFIG, timeout=15,
     )
     dt = time.time() - t0
-    # 预期被拒绝
-    denied = "ACCESS_DENIED" in out or rc != 0
+    # 预期被拒绝 — 必须收到 ACCESS_DENIED
     return runner.make_result(
         "Deny: 拒绝访问 Program Files", "文件ACL-Deny", "x64",
         rc, out, err,
-        expected_text="ACCESS_DENIED" if denied else None,
+        expected_text="ACCESS_DENIED",
         duration=dt,
     )
 
@@ -183,11 +191,10 @@ def test_deny_cannot_write_program_files(runner: SandboxRunner) -> TestResult:
         config=DENY_CONFIG, timeout=15,
     )
     dt = time.time() - t0
-    denied = "WRITE_DENIED" in out or rc != 0
     return runner.make_result(
         "Deny: 禁止写入 Program Files", "文件ACL-Deny", "x64",
         rc, out, err,
-        expected_text="WRITE_DENIED" if denied else None,
+        expected_text="WRITE_DENIED",
         duration=dt,
     )
 
@@ -213,12 +220,16 @@ def test_mkdir_readonly(runner: SandboxRunner) -> TestResult:
         new_dir.rmdir()
 
     denied = "MKDIR_DENIED" in out or rc != 0
-    return runner.make_result(
+    result = runner.make_result(
         "mkdir ReadOnly: 禁止创建目录", "文件ACL-mkdir", "x64",
         rc, out, err,
-        expected_text="MKDIR_DENIED" if denied else None,
+        expected_text="MKDIR_DENIED",
         duration=dt,
     )
+    if result.passed and not denied:
+        result.passed = False
+        result.error = "输出中未找到 MKDIR_DENIED 且目录可能已被创建"
+    return result
 
 
 def test_mkdir_inherit(runner: SandboxRunner) -> TestResult:
@@ -300,13 +311,17 @@ def test_rename_inherit(runner: SandboxRunner) -> TestResult:
     if new_file.exists():
         new_file.unlink()
 
-    return runner.make_result(
+    result = runner.make_result(
         "Rename Inherit: 允许重命名", "文件ACL-Rename", "x64",
         rc, out, err,
         expected_rc=0,
-        expected_text="RENAME_OK" if renamed else None,
+        expected_text="RENAME_OK",
         duration=dt,
     )
+    if result.passed and not renamed:
+        result.passed = False
+        result.error = "输出含 RENAME_OK 但目标文件未创建"
+    return result
 
 
 def test_rename_to_readonly_blocked(runner: SandboxRunner) -> TestResult:
@@ -332,12 +347,16 @@ def test_rename_to_readonly_blocked(runner: SandboxRunner) -> TestResult:
         ro_dest.unlink()
 
     blocked = "RENAME_BLOCKED" in out or rc != 0
-    return runner.make_result(
+    result = runner.make_result(
         "Rename ReadOnly: 禁止到只读区域", "文件ACL-Rename", "x64",
         rc, out, err,
-        expected_text="RENAME_BLOCKED" if blocked else None,
+        expected_text="RENAME_BLOCKED",
         duration=dt,
     )
+    if result.passed and not blocked:
+        result.passed = False
+        result.error = "输出中未找到 RENAME_BLOCKED 且退出码为0"
+    return result
 
 
 # ─── 目录删除测试（NtSetInformationFile + NtDeleteFile Hook）────────────
@@ -360,12 +379,17 @@ def test_rmdir_inherit(runner: SandboxRunner) -> TestResult:
     if test_dir.exists():
         test_dir.rmdir()
 
-    return runner.make_result(
+    result = runner.make_result(
         "rmdir Inherit: 允许删除目录", "文件ACL-rmdir", "x64",
         rc, out, err,
-        expected_rc=0 if dir_removed else None,
+        expected_rc=0,
+        expected_text="RMDIR_OK",
         duration=dt,
     )
+    if result.passed and not dir_removed:
+        result.passed = False
+        result.error = "输出含 RMDIR_OK 但目录未被删除"
+    return result
 
 
 def test_rmdir_readonly_blocked(runner: SandboxRunner) -> TestResult:
@@ -382,16 +406,20 @@ def test_rmdir_readonly_blocked(runner: SandboxRunner) -> TestResult:
     )
     dt = time.time() - t0
 
-    blocked = test_dir.exists() or "RMDIR_BLOCKED" in out
+    dir_still_exists = test_dir.exists()
     if test_dir.exists():
         test_dir.rmdir()
 
-    return runner.make_result(
+    # ★ rmdir 也可能返回 0 即使失败，以目录是否仍然存在为准
+    result = runner.make_result(
         "rmdir ReadOnly: 禁止删除目录", "文件ACL-rmdir", "x64",
         rc, out, err,
-        expected_text="RMDIR_BLOCKED" if blocked else None,
         duration=dt,
     )
+    if not dir_still_exists:
+        result.passed = False
+        result.error = "目录已被删除（沙箱未阻止删除）"
+    return result
 
 
 # ─── 硬链接测试（NtSetInformationFile + CheckFilePermissionWithHardLinks）─
@@ -419,12 +447,16 @@ def test_hardlink_to_deny_blocked(runner: SandboxRunner) -> TestResult:
         link_path.unlink()
 
     blocked = "LINK_BLOCKED" in out or rc != 0
-    return runner.make_result(
+    result = runner.make_result(
         "Hardlink Deny: 禁止到拒绝区域", "文件ACL-Hardlink", "x64",
         rc, out, err,
-        expected_text="LINK_BLOCKED" if blocked else None,
+        expected_text="LINK_BLOCKED",
         duration=dt,
     )
+    if result.passed and not blocked:
+        result.passed = False
+        result.error = "输出中未找到 LINK_BLOCKED 且退出码为0"
+    return result
 
 
 def test_hardlink_inherit_allowed(runner: SandboxRunner) -> TestResult:
@@ -451,13 +483,19 @@ def test_hardlink_inherit_allowed(runner: SandboxRunner) -> TestResult:
     if link_file.exists():
         link_file.unlink()
 
-    return runner.make_result(
+    # ★ 硬链接必须创建成功 — 如果创建失败，应标记为失败而非通过
+    result = runner.make_result(
         "Hardlink Inherit: 允许同区域", "文件ACL-Hardlink", "x64",
         rc, out, err,
-        expected_rc=0 if link_created else None,
-        expected_text="LINK_OK" if link_created else None,
+        expected_rc=0,
+        expected_text="LINK_OK",
         duration=dt,
     )
+    # 如果退出码和文本都匹配但文件不存在，仍是失败
+    if result.passed and not link_created:
+        result.passed = False
+        result.error = "mklink 命令成功但硬链接文件未创建"
+    return result
 
 
 # ─── 边界/边缘测试 ──────────────────────────────────────────────────

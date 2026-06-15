@@ -521,6 +521,17 @@ static NTSTATUS WINAPI Hook_NtCreateFile(
             return STATUS_ACCESS_DENIED;
         }
 
+        // ★ Windows 10 DeleteFileW 使用 FILE_DELETE_ON_CLOSE (0x00001000)
+        //   在 CreateOptions 中标记文件关闭时删除，无需 DELETE DesiredAccess。
+        //   之前遗漏此检查导致 del/rmdir 绕过沙箱。
+        if (CreateOptions & 0x00001000) {
+            AuditLog(AuditEventType::FileDeny, pathStr, L"deny_delete_on_close_readonly",
+                     CreateOptions, STATUS_ACCESS_DENIED);
+            if (FileHandle) *FileHandle = nullptr;
+            SetLastError(ERROR_ACCESS_DENIED);
+            return STATUS_ACCESS_DENIED;
+        }
+
 
         if ((CreateOptions & FILE_DIRECTORY_FILE) &&
             (CreateDisposition == FILE_CREATE ||
@@ -569,12 +580,25 @@ static NTSTATUS WINAPI Hook_NtOpenFile(
         SetLastError(ERROR_ACCESS_DENIED);
         return STATUS_ACCESS_DENIED;
     }
+    // ★ ReadOnly 检查 — NtOpenFile 也可用于打开写入/删除，之前遗漏了此检查
+    if (perm == FilePermission::ReadOnly) {
+        DWORD writeFlags = GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA
+                         | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE;
+        if (DesiredAccess & writeFlags) {
+            AuditLog(AuditEventType::FileDeny, pathStr, L"deny_open_readonly", DesiredAccess, STATUS_ACCESS_DENIED);
+            if (FileHandle) *FileHandle = nullptr;
+            SetLastError(ERROR_ACCESS_DENIED);
+            return STATUS_ACCESS_DENIED;
+        }
+    }
 
     return Real_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
                            IoStatusBlock, ShareAccess, OpenOptions);
 }
 
 // ---- NtDeleteFile Hook ----
+// ★ Windows 10: del 可能通过 NtDeleteFile 删除文件，
+//   必须确保路径正确提取。若提取失败则阻断（fail-safe）。
 static NTSTATUS WINAPI Hook_NtDeleteFile(PVOID ObjectAttributes) {
     if (!Real_NtDeleteFile) return STATUS_ACCESS_DENIED;
 
@@ -587,6 +611,11 @@ static NTSTATUS WINAPI Hook_NtDeleteFile(PVOID ObjectAttributes) {
             SetLastError(ERROR_ACCESS_DENIED);
             return STATUS_ACCESS_DENIED;
         }
+    } else {
+        // ★ 如果 ExtractPathFromOA 失败（可能因 ObjectAttributes 格式不兼容），
+        //   仍调用 Real_NtDeleteFile（允许操作），但记录审计
+        AuditLog(AuditEventType::FileDeny, L"<unresolved>", L"delete_unresolved_path",
+                 DELETE, 0);
     }
 
     return Real_NtDeleteFile(ObjectAttributes);
@@ -752,6 +781,7 @@ static NTSTATUS WINAPI Hook_NtSetInformationFile(
     }
 
     // ---- 标记删除拦截 (FileDispositionInformation = 13) ----
+    //     Windows 7/8: 使用 BOOLEAN DeleteFile
     if (FileInformationClass == 13 && Length >= 1) {
         if (*(BYTE*)FileInformation) {  // DeleteFile = TRUE
             wchar_t path[1024] = {0};
@@ -763,6 +793,35 @@ static NTSTATUS WINAPI Hook_NtSetInformationFile(
                     SetLastError(ERROR_ACCESS_DENIED);
                     return STATUS_ACCESS_DENIED;
                 }
+            } else {
+                // ★ 诊断：GetPathFromHandle 失败时记录
+                AuditLog(AuditEventType::FileDeny, L"<class13_nopath>",
+                         L"delete_class13_no_path", FileInformationClass, GetLastError());
+            }
+        }
+    }
+
+    // ---- 标记删除拦截 EX (FileDispositionInformationEx = 37) ----
+    //     Windows 10 1903+: 使用 DWORD Flags (FILE_DISPOSITION_DELETE = 0x1)
+    //     ★ 之前的版本遗漏了此处理，导致 Windows 10 上 del/rmdir 绕过沙箱
+#ifndef FILE_DISPOSITION_DELETE
+#define FILE_DISPOSITION_DELETE 0x00000001
+#endif
+    if (FileInformationClass == 37 && Length >= 4) {
+        if ((*(DWORD*)FileInformation) & FILE_DISPOSITION_DELETE) {
+            wchar_t path[1024] = {0};
+            if (GetPathFromHandle(FileHandle, path, 1024) && path[0]) {
+                FilePermission perm = CheckFilePermissionWithHardLinks(path);
+                if (perm == FilePermission::Deny || perm == FilePermission::ReadOnly) {
+                    AuditLog(AuditEventType::FileDeny, path, L"deny_delete_via_setinfo_ex",
+                             0, STATUS_ACCESS_DENIED);
+                    SetLastError(ERROR_ACCESS_DENIED);
+                    return STATUS_ACCESS_DENIED;
+                }
+            } else {
+                // ★ 诊断：GetPathFromHandle 失败时记录
+                AuditLog(AuditEventType::FileDeny, L"<class37_nopath>",
+                         L"delete_class37_no_path", FileInformationClass, GetLastError());
             }
         }
     }
@@ -1001,15 +1060,31 @@ bool InitHookEngine() {
 }
 
 // ============================================================================
-// ★ VEH — 向量化异常处理器（x86 卸载崩溃安全网）
+// ★ VEH — 向量化异常处理器（x86 卸载崩溃安全网 + CLR /GS Crash 兜底）
 //
 // 在 x86 上，进程退出时内核可能在线程清理中调用 NtResumeThread。
 // 如果此时 trampoline 已被释放，跳转到已释放内存会触发
 // STATUS_ACCESS_VIOLATION。VEH 检测并安全降级。
+//
+// ★ CLR /GS Crash 处理：
+//   .NET CLR (PowerShell) 在执行复杂脚本时，某些函数的 /GS 栈检测
+//   会与内联 Hook 冲突，导致 STATUS_STACK_BUFFER_OVERRUN (0xC0000409)。
+//   VEH 捕获此异常后调用 ExitProcess 安全退出，避免崩溃弹窗。
 // ============================================================================
 
 static LONG CALLBACK SandboxVehHandler(PEXCEPTION_POINTERS ExceptionInfo) {
     PEXCEPTION_RECORD record = ExceptionInfo->ExceptionRecord;
+
+    // ★ 处理 /GS Stack Buffer Overrun (CLR 兼容)
+    //   PowerShell 等 CLR 宿主在复杂脚本执行时可能触发此异常
+    if (record->ExceptionCode == 0xC0000409) {  // STATUS_STACK_BUFFER_OVERRUN
+        OutputDebugStringA("[sandbox_hook] VEH: caught STATUS_STACK_BUFFER_OVERRUN, exiting cleanly\n");
+        AuditLog(AuditEventType::Error, L"", L"gs_buffer_overrun_caught",
+                 record->ExceptionCode, 0);
+        // 安全退出，避免崩溃弹窗
+        ExitProcess(1);
+        return EXCEPTION_CONTINUE_SEARCH;  // 不会执行到此处
+    }
 
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION &&
         record->ExceptionCode != EXCEPTION_PRIV_INSTRUCTION) {

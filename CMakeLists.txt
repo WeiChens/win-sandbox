@@ -53,6 +53,21 @@ add_custom_target(sandbox-hook-x86 ALL
 )
 
 # ============================================================================
+# 1.5. WOW64 注入辅助程序 (32-bit)
+# ============================================================================
+set(INJECT_HELPER_DIR ${SANDBOX_ROOT}/dll/inject-helper)
+
+add_custom_target(inject-helper-x86 ALL
+    COMMAND ${CMAKE_COMMAND} -B ${INJECT_HELPER_DIR}/build -A Win32 -DCMAKE_BUILD_TYPE=Release
+    COMMAND ${CMAKE_COMMAND} --build ${INJECT_HELPER_DIR}/build --config Release
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${INJECT_HELPER_DIR}/build/Release/inject_helper.exe
+        ${OUTPUT_DIR}/sandbox_helper_x86.exe
+    WORKING_DIRECTORY ${INJECT_HELPER_DIR}
+    COMMENT "Building inject-helper.exe (x86) → output/"
+)
+
+# ============================================================================
 # 2 & 3. Rust 项目 (sandbox-core + sandbox-host)
 # ============================================================================
 if(WIN32)

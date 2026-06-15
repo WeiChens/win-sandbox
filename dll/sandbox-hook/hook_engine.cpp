@@ -513,6 +513,17 @@ static NTSTATUS WINAPI Hook_NtCreateFile(
             return STATUS_ACCESS_DENIED;
         }
 
+        // ★ Windows 10 DeleteFileW 使用 FILE_DELETE_ON_CLOSE (0x00001000)
+        //   在 CreateOptions 中标记文件关闭时删除，无需 DELETE DesiredAccess。
+        //   之前遗漏此检查导致 del/rmdir 绕过沙箱。
+        if (CreateOptions & 0x00001000) {
+            AuditLog(AuditEventType::FileDeny, pathStr, L"deny_delete_on_close_readonly",
+                     CreateOptions, STATUS_ACCESS_DENIED);
+            if (FileHandle) *FileHandle = nullptr;
+            SetLastError(ERROR_ACCESS_DENIED);
+            return STATUS_ACCESS_DENIED;
+        }
+
         #define FILE_DIRECTORY_FILE  0x00000001
         #define FILE_OPEN            0x00000001
         #define FILE_CREATE          0x00000002
@@ -566,6 +577,17 @@ static NTSTATUS WINAPI Hook_NtOpenFile(
         if (FileHandle) *FileHandle = nullptr;
         SetLastError(ERROR_ACCESS_DENIED);
         return STATUS_ACCESS_DENIED;
+    }
+    // ★ ReadOnly 检查 — NtOpenFile 也可用于打开写入/删除，之前遗漏了此检查
+    if (perm == FilePermission::ReadOnly) {
+        DWORD writeFlags = GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA
+                         | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE;
+        if (DesiredAccess & writeFlags) {
+            AuditLog(AuditEventType::FileDeny, pathStr, L"deny_open_readonly", DesiredAccess, STATUS_ACCESS_DENIED);
+            if (FileHandle) *FileHandle = nullptr;
+            SetLastError(ERROR_ACCESS_DENIED);
+            return STATUS_ACCESS_DENIED;
+        }
     }
 
     return Real_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
@@ -750,6 +772,7 @@ static NTSTATUS WINAPI Hook_NtSetInformationFile(
     }
 
     // ---- 标记删除拦截 (FileDispositionInformation = 13) ----
+    //     Windows 7/8: 使用 BOOLEAN DeleteFile
     if (FileInformationClass == 13 && Length >= 1) {
         if (*(BYTE*)FileInformation) {  // DeleteFile = TRUE
             wchar_t path[1024] = {0};
@@ -757,6 +780,27 @@ static NTSTATUS WINAPI Hook_NtSetInformationFile(
                 FilePermission perm = CheckFilePermissionWithHardLinks(path);
                 if (perm == FilePermission::Deny || perm == FilePermission::ReadOnly) {
                     AuditLog(AuditEventType::FileDeny, path, L"deny_delete_via_setinfo",
+                             0, STATUS_ACCESS_DENIED);
+                    SetLastError(ERROR_ACCESS_DENIED);
+                    return STATUS_ACCESS_DENIED;
+                }
+            }
+        }
+    }
+
+    // ---- 标记删除拦截 EX (FileDispositionInformationEx = 37) ----
+    //     Windows 10 1903+: 使用 DWORD Flags (FILE_DISPOSITION_DELETE = 0x1)
+    //     ★ 之前的版本遗漏了此处理，导致 Windows 10 上 del/rmdir 绕过沙箱
+#ifndef FILE_DISPOSITION_DELETE
+#define FILE_DISPOSITION_DELETE 0x00000001
+#endif
+    if (FileInformationClass == 37 && Length >= 4) {
+        if ((*(DWORD*)FileInformation) & FILE_DISPOSITION_DELETE) {
+            wchar_t path[1024] = {0};
+            if (GetPathFromHandle(FileHandle, path, 1024) && path[0]) {
+                FilePermission perm = CheckFilePermissionWithHardLinks(path);
+                if (perm == FilePermission::Deny || perm == FilePermission::ReadOnly) {
+                    AuditLog(AuditEventType::FileDeny, path, L"deny_delete_via_setinfo_ex",
                              0, STATUS_ACCESS_DENIED);
                     SetLastError(ERROR_ACCESS_DENIED);
                     return STATUS_ACCESS_DENIED;

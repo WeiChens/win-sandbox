@@ -120,13 +120,17 @@ def test_x86_readonly_deny_write(runner: SandboxRunner) -> TestResult:
         test_file.unlink()
 
     blocked = "WRITE_BLOCKED" in out
-    return runner.make_result(
+    # ★ x86 注入已修复，ReadOnly 应正常工作
+    result = runner.make_result(
         "x86 ReadOnly: 禁止写入", "x86/WOW64", "x86",
         rc, out, err,
-        expected_text="WRITE_BLOCKED" if blocked else None,
-        known_fail=not blocked,
+        expected_text="WRITE_BLOCKED",
         duration=dt,
     )
+    if result.passed and not blocked:
+        result.passed = False
+        result.error = "x86 ReadOnly 写入未被阻止！输出中未找到 WRITE_BLOCKED"
+    return result
 
 
 # ─── 测试注册表 ──────────────────────────────────────────────────────
