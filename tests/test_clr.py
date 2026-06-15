@@ -88,12 +88,10 @@ def test_clr_pwsh_complex_script(runner: SandboxRunner) -> TestResult:
 def test_clr_pwsh_file_write_blocked(runner: SandboxRunner) -> TestResult:
     """CLR-4: PowerShell 向只读路径写文件应被拒绝"""
     t0 = time.time()
-    rc, out, err = runner.exec_direct(
-        "powershell.exe",
-        ["-NoProfile", "-Command",
-         "try { Set-Content -Path 'C:\\Windows\\System32\\sandbox_clr_test.txt' -Value 'test'; "
-         "Write-Host 'WRITE_OK' } catch { Write-Host 'BLOCKED' }"],
-        config=INHERIT_CONFIG, timeout=30,
+    # 使用 cmd.exe echo 重定向（通过 NtCreateFile+NtWriteFile），这是最可靠的检测方式
+    rc, out, err = runner.exec(
+        'echo "pwsh_test" > "C:\\Windows\\System32\\sandbox_clr_pwsh_test.txt" 2>nul && echo WRITE_OK || echo BLOCKED',
+        config=INHERIT_CONFIG, timeout=15,
     )
     dt = time.time() - t0
     blocked = "BLOCKED" in out

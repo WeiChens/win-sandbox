@@ -89,7 +89,7 @@ sandbox-host.exe (Rust, x64)
     │  │  ├─ NtOpenFile        → 文件打开权限检查            │
     │  │  ├─ NtDeleteFile      → 文件删除权限检查             │
     │  │  ├─ NtSetInformationFile → 重命名/硬链接/删除标记   │
-    │  │  ├─ NtWriteFile       → 写入权限检查                │
+    │  │  ├─ NtWriteFile       → 写入权限检查（NtQueryObject 快速路径）│
     │  │  ├─ NtCreateUserProcess → 子进程挂起 + 追踪         │
     │  │  ├─ NtResumeThread    → 自注入 + 恢复               │
     │  │  ├─ WSAStartup        → 延迟安装 connect/DNS Hook   │
