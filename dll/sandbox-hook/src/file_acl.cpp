@@ -74,6 +74,9 @@ static FilePermission ParsePermission(const std::string& perm) {
     return FilePermission::Inherit;
 }
 
+// ★ 前向声明：按精确度排序规则（实现在 InitFileAcl 下方）
+static void SortRulesBySpecificity();
+
 bool InitFileAcl(const std::string& json) {
     std::lock_guard<std::mutex> lock(g_aclMutex);
     g_fileRules.clear();
@@ -128,8 +131,68 @@ bool InitFileAcl(const std::string& json) {
         pos = objEnd + 1;
     }
 
+    // ★ 按精确度从高到低排序，确保最具体的规则优先匹配
+    SortRulesBySpecificity();
+
     g_initialized = true;
     return true;
+}
+
+// ============================================================================
+// 规则排序（按精确度从高到低）
+//
+// ★ 问题：如果按 JSON 顺序匹配，C:\Users\*\*（通配）会先于
+//   C:\Users\wei\Desktop\test\**（具体）匹配，导致具体规则永远不生效。
+//
+// ★ 修复：加载规则后按"精确度"排序。精确度计算：
+//   1. 统计路径中完全字面量（无通配符 *?）的段数 × 100
+//   2. 减去通配符总数（更少通配符 = 更精确）
+//   3. 加上模式总长度（更长 = 更精确，作为 tiebreaker）
+//   得分越高 → 越优先匹配
+// ============================================================================
+
+/// 计算规则的精确度得分
+static int CalcRuleScore(const std::wstring& pattern) {
+    int score = 0;
+    int wildcardCount = 0;
+    int literalSegments = 0;
+    size_t segStart = 0;
+
+    for (size_t i = 0; i <= pattern.length(); i++) {
+        if (i == pattern.length() || pattern[i] == L'\\') {
+            // 提取一个段
+            std::wstring seg = pattern.substr(segStart, i - segStart);
+            if (!seg.empty()) {
+                bool hasWildcard = false;
+                for (wchar_t ch : seg) {
+                    if (ch == L'*' || ch == L'?') {
+                        wildcardCount++;
+                        hasWildcard = true;
+                    }
+                }
+                if (!hasWildcard) {
+                    literalSegments++;
+                }
+            }
+            segStart = i + 1;
+        }
+    }
+
+    // 得分 = 字面量段数 × 100 - 通配符数 + 模式长度/10（tiebreaker）
+    score = literalSegments * 100 - wildcardCount + (int)(pattern.length() / 10);
+    return score;
+}
+
+/// 按精确度排序规则（最高分优先）
+static void SortRulesBySpecificity() {
+    std::sort(g_fileRules.begin(), g_fileRules.end(),
+        [](const FileRule& a, const FileRule& b) {
+            int scoreA = CalcRuleScore(a.pattern);
+            int scoreB = CalcRuleScore(b.pattern);
+            if (scoreA != scoreB) return scoreA > scoreB;
+            // 同分时按原始顺序（稳定排序）
+            return false;
+        });
 }
 
 // ============================================================================
@@ -141,7 +204,8 @@ FilePermission CheckFilePermission(const std::wstring& path) {
 
     std::lock_guard<std::mutex> lock(g_aclMutex);
 
-    // 第一个匹配的规则生效
+    // ★ 按精确度从高到低匹配，最具体的规则优先
+    //   例如 C:\Users\wei\Desktop\test\**（得分 500+）优先于 C:\Users\*\*（得分 200-）
     for (const auto& rule : g_fileRules) {
         if (GlobMatch(rule.pattern, path)) {
             g_lastMatchedRule = rule.pattern;

@@ -27,11 +27,15 @@
     },
     {
       "pattern": "C:\\Program Files\\**",
-      "permission": "deny"
+      "permission": "read_only"
     },
     {
       "pattern": "C:\\Program Files (x86)\\**",
-      "permission": "deny"
+      "permission": "read_only"
+    },
+    {
+      "pattern": "C:\\Users\\wei\\Desktop\\test\\**",
+      "permission": "read_only"
     }
   ],
   "network_permissions": [
