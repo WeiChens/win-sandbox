@@ -329,17 +329,18 @@ static NTSTATUS WINAPI Hook_NtCreateUserProcess(
         return STATUS_ACCESS_DENIED;
     }
 
-    bool isClr = IsClrLoaded();
+    // ★ 所有子进程统一挂起 + 在 NtResumeThread 中注入。
+    //    不论父进程是否是 CLR（PowerShell等），子进程都是非 CLR 进程，
+    //    挂起+注入是最安全的方式（避免 loader lock 竞争）。
+    //    /GS 栈检测冲突已由 detour.cpp 的 CALL rel32 重定位修复解决。
 
     NTSTATUS status = Real_NtCreateUserProcess(
         ProcessHandle, ThreadHandle,
         ProcessDesiredAccess, ThreadDesiredAccess,
         ProcessObjectAttributes, ThreadObjectAttributes,
-        isClr ? ProcessFlags : (ProcessFlags | CREATE_SUSPENDED_FLAG),
+        ProcessFlags | CREATE_SUSPENDED_FLAG,
         ThreadFlags,
         ProcessParameters, CreateInfo, AttributeList);
-
-    if (isClr) return status;
 
     wchar_t recurEnv[4] = {0};
     if (GetEnvironmentVariableW(L"SBOX_RECURSIVE_INJECTION", recurEnv, 4) > 0) {
@@ -382,7 +383,6 @@ static NTSTATUS WINAPI Hook_NtResumeThread(HANDLE hThread) {
     if (!Real_NtResumeThread) return STATUS_ACCESS_DENIED;
 
     if (g_dll_detaching.load()) return STATUS_ACCESS_DENIED;
-    if (IsClrLoaded()) return Real_NtResumeThread(hThread);
 
     TrackedProcess* tp = FindByThread(hThread);
     if (tp && !tp->bInjected) {
