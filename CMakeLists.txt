@@ -7,7 +7,9 @@ project(windows-sandbox
 
 # ============================================================================
 # Windows Sandbox — 一键构建所有子项目
-#
+# cmake -B build -DCMAKE_BUILD_TYPE=Release
+# cmake --build build --config Release
+# ============================================================================
 # 子项目:
 #   1. sandbox-hook    — C++ 注入 DLL (CMake)
 #   2. sandbox-core    — Rust 共享类型库 (Cargo)
