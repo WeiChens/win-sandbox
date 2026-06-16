@@ -6,7 +6,7 @@
 #include "ipc_client.h"
 #include "utils.h"
 #include <windows.h>
-#include <shlobj.h>      // SHGetFolderPathW, CSIDL_PROGRAM_FILES
+#include <shlobj.h>      // SHGetFolderPathW（回退路径用）
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -213,10 +213,10 @@ FilePermission CheckFilePermission(const std::wstring& path) {
         }
     }
 
-    // 无匹配规则：默认 Inherit（完全放行）
-    // ★ 注意：如果规则列表为空（配置缺失），所有路径全部放行。
-    //   如果希望安全优先，可在配置中添加顶级 deny 规则。
-    return FilePermission::Inherit;
+    // 无匹配规则：默认 ReadOnly（安全优先）
+    // 所有未明确放行(inherit)的路径默认为只读，防止遗漏规则导致安全漏洞。
+    // 如需完全放行某路径，需显式配置 "inherit" 规则。
+    return FilePermission::ReadOnly;
 }
 
 // ============================================================================
@@ -610,18 +610,45 @@ static void InitWow64RedirectRules() {
     // winDirUpper = "C:\\WINDOWS" (无末尾反斜杠)
 
     // 获取 Program Files 目录
+    // ★ 必须使用 ProgramW6432 环境变量（始终返回 64 位路径，不受 WOW64 重定向影响）
+    //   在 32 位 (WOW64) 进程中，SHGetFolderPathW(CSIDL_PROGRAM_FILES) 被重定向到
+    //   "C:\Program Files (x86)"，但我们需要的是真正的 "C:\Program Files"
     wchar_t progFiles[MAX_PATH] = {0};
-    if (SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr, 0, progFiles) == 0) {
-        std::transform(progFiles, progFiles + wcslen(progFiles), progFiles, ::towupper);
+    std::wstring pfDir;
+    
+    // 优先使用 ProgramW6432 环境变量（这是唯一在 WOW64 下始终返回 64 位路径的方法）
+    DWORD envLen = GetEnvironmentVariableW(L"ProgramW6432", progFiles, MAX_PATH);
+    if (envLen > 0 && envLen < MAX_PATH) {
+        std::transform(progFiles, progFiles + envLen, progFiles, ::towupper);
+        pfDir = progFiles;
     } else {
-        wcscpy_s(progFiles, L"C:\\PROGRAM FILES");
+        // 回退到 SHGetFolderPathW（在 64 位进程下正确，32 位下错误但聊胜于无）
+        if (SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr, 0, progFiles) == 0) {
+            std::transform(progFiles, progFiles + wcslen(progFiles), progFiles, ::towupper);
+        } else {
+            wcscpy_s(progFiles, L"C:\\PROGRAM FILES");
+        }
+        pfDir = progFiles;
     }
-    std::wstring pfDir(progFiles);
+
+    // 获取 Program Files (x86) 目录
+    wchar_t progFilesX86[MAX_PATH] = {0};
+    envLen = GetEnvironmentVariableW(L"ProgramFiles(x86)", progFilesX86, MAX_PATH);
+    if (envLen > 0 && envLen < MAX_PATH) {
+        std::transform(progFilesX86, progFilesX86 + envLen, progFilesX86, ::towupper);
+    } else {
+        // 回退：由 pfDir + " (X86)" 构造
+        wcscpy_s(progFilesX86, pfDir.c_str());
+        wcscat_s(progFilesX86, L" (X86)");
+    }
+    std::wstring pfDirX86(progFilesX86);
 
     g_wow64Rules.clear();
     g_wow64Rules.push_back({ winDirUpper + L"\\SYSWOW64\\", winDirUpper + L"\\SYSTEM32\\" });
     g_wow64Rules.push_back({ winDirUpper + L"\\SYSNATIVE\\", winDirUpper + L"\\SYSTEM32\\" });
-    g_wow64Rules.push_back({ pfDir + L" (X86)\\", pfDir + L"\\" });
+    // redirected = SysWOW64下看到的路径（如 C:\Program Files (x86)\...）
+    // original   = ACL 规则中使用的原生路径（如 C:\Program Files\...）
+    g_wow64Rules.push_back({ pfDirX86 + L"\\", pfDir + L"\\" });
 
     g_wow64RulesInitialized = true;
     LeaveWow64Init();
