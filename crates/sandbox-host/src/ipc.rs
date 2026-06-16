@@ -186,7 +186,16 @@ impl IpcServer {
     pub fn audit_shm_name(&self) -> &str { &self.audit_shm_name }
     pub fn host_pid(&self) -> u32 { self.host_pid }
 
-    /// 从 Ring Buffer 消费审计事件
+    /// 从 Ring Buffer 消费审计事件（多线程安全）
+    ///
+    /// ★ 多线程安全设计：
+    ///   C++ 写入端使用 _padding 字段作为 valid 标志：
+    ///     1. ZeroMemory → _padding = 0（无效）
+    ///     2. 写入所有数据字段
+    ///     3. MemoryBarrier() + _padding = 1（标记有效）
+    ///   本读取端先检查 _padding：
+    ///     - _padding != 1 → 槽位正在被写入，跳过（等下一轮 poll）
+    ///     - _padding == 1 → 所有字段已完整写入，可安全读取
     pub fn poll_audit(&self) -> Vec<AuditEvent> {
         let header = unsafe { &*self.audit_header };
         let mut read_pos = self.audit_read_pos.lock().unwrap();
@@ -196,9 +205,23 @@ impl IpcServer {
 
         while *read_pos < write_pos {
             let slot_idx = (*read_pos % header.slot_count) as usize;
-            // ★ 使用 ptr::read_unaligned 安全读取共享内存中的槽位
+            let slot_ptr = unsafe { self.audit_slots.add(slot_idx) };
+
+            // ★ 多线程安全：先读取 _padding 有效标志
+            //   _padding == 0: 槽位正在被写入，跳过（等待下一轮 poll）
+            //   _padding == 1: 槽位已完整写入，可以安全读取
+            let valid: u32 = unsafe {
+                std::ptr::read_unaligned(&(*slot_ptr)._padding)
+            };
+            if valid != 1 {
+                // 槽位尚未完成写入，跳过
+                *read_pos += 1;
+                continue;
+            }
+
+            // ★ 槽位已验证为完整写入，安全读取所有字段
             let slot: AuditEventC = unsafe {
-                std::ptr::read_unaligned(self.audit_slots.add(slot_idx))
+                std::ptr::read_unaligned(slot_ptr)
             };
 
             // 转换二进制事件 → Rust AuditEvent

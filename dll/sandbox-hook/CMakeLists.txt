@@ -110,6 +110,7 @@ target_link_libraries(sandbox_hook PRIVATE
     user32.lib
     ws2_32.lib
     advapi32.lib
+    shell32.lib          # SHGetFolderPathW for WOW64 dynamic path detection
 )
 
 install(TARGETS sandbox_hook

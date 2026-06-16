@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <vector>
+#include <list>
 #include <string>
 #include <atomic>
 
@@ -43,7 +44,7 @@ struct TrackedProcess {
 };
 
 /// 追踪记录列表 + 关键区（在 hook_process.cpp 中定义）
-extern std::vector<TrackedProcess> g_tracked;
+extern std::list<TrackedProcess> g_tracked;
 extern CRITICAL_SECTION g_track_cs;
 
 /// 在追踪列表中查找指定线程

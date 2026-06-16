@@ -624,10 +624,8 @@ static int WSAAPI Hook_WSAStartup(WORD wVersionRequested, LPWSADATA lpWSAData) {
     if (!Real_WSAStartup) return WSASYSNOTREADY;
 
     // 首次调用 WSAStartup 时，安装所有 ws2_32 Hook
-    static bool ws2HooksInstalled = false;
-    if (!ws2HooksInstalled) {
-        ws2HooksInstalled = true;
-
+    // ★ 使用 Real_connect 判断而非静态标志，以处理 ws2_32.dll 卸载重载的情况
+    if (Real_connect == nullptr) {
         HMODULE hWs2 = GetModuleHandleW(L"ws2_32.dll");
         if (hWs2) {
             // connect
@@ -665,7 +663,7 @@ static int WSAAPI Hook_WSAStartup(WORD wVersionRequested, LPWSADATA lpWSAData) {
                 if (tramp) Real_WSAConnect = (PFN_WSAConnect)tramp;
             }
 
-                    // ★ WSAIoctl — 拦截 ConnectEx 获取，防止绕过 connect/WSAConnect
+            // ★ WSAIoctl — 拦截 ConnectEx 获取，防止绕过 connect/WSAConnect
             auto* wsaIoctlTarget = (BYTE*)GetProcAddress(hWs2, "WSAIoctl");
             if (wsaIoctlTarget) {
                 auto* tramp = (BYTE*)DetourInstall(wsaIoctlTarget, (BYTE*)Hook_WSAIoctl, "WSAIoctl");

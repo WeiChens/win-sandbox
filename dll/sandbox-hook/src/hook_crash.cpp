@@ -67,17 +67,27 @@ static void STDMETHODCALLTYPE Hook_CorExitProcess(int exitCode) {
 }
 
 // ============================================================================
-// SetUnhandledExceptionFilter Hook — 崩溃前刷出审计
+// SetUnhandledExceptionFilter Hook — 崩溃前刷出审计，并调用应用 handler
 // ============================================================================
 
 typedef LPTOP_LEVEL_EXCEPTION_FILTER (WINAPI *PFN_SetUnhandledExceptionFilter)(
     LPTOP_LEVEL_EXCEPTION_FILTER lpTopLevelExceptionFilter);
 static PFN_SetUnhandledExceptionFilter Real_SetUnhandledExceptionFilter = nullptr;
 
+/// 保存应用原始 UEF handler，刷出审计后调用
+static LPTOP_LEVEL_EXCEPTION_FILTER g_appUefHandler = nullptr;
+
 static LONG WINAPI SandboxUefHandler(PEXCEPTION_POINTERS ExceptionInfo) {
+    // 1. 先刷出审计
     AuditLog(AuditEventType::Error, L"", L"unhandled_exception",
              ExceptionInfo->ExceptionRecord->ExceptionCode, 0);
     OutputDebugStringA("[sandbox_hook] Unhandled exception caught, audit flushed\n");
+
+    // 2. 调用应用原本的 handler（如果有）
+    if (g_appUefHandler) {
+        return g_appUefHandler(ExceptionInfo);
+    }
+
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -87,13 +97,18 @@ static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI Hook_SetUnhandledExceptionFilter(
     //    会递归进入本 Hook → 栈溢出 (0xC00000FD)。
     //    通过 Real_ 指针调用原始函数以避免递归。
     //
-    // 无论应用程序设置什么 handler，我们都插入自己的前置 handler
-    // （VEH 仍然优先于 UEF，这是额外的安全保障）
+    // ★ 保存应用的 handler，在 SandboxUefHandler 中先刷审计再调用
+    g_appUefHandler = lpTopLevelExceptionFilter;
+
+    // 安装我们的 handler（通过原始函数）
     if (Real_SetUnhandledExceptionFilter) {
         Real_SetUnhandledExceptionFilter(SandboxUefHandler);
     }
-    // 忽略应用程序的 handler，我们总是使用自己的 handler
-    return nullptr;
+
+    // 返回 nullptr 表示旧 handler（Windows 文档说 SetUnhandledExceptionFilter
+    // 返回旧的 handler 指针，但我们替换了它，返回旧值可能被应用误用）
+    // 返回非空值让应用知道有一个 handler 已存在
+    return (LPTOP_LEVEL_EXCEPTION_FILTER)(LONG_PTR)1;
 }
 
 // ============================================================================

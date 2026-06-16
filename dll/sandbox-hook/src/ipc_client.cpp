@@ -77,7 +77,16 @@ bool InitIpcClient() {
 }
 
 // ============================================================================
-// Ring Buffer 写入
+// Ring Buffer 写入（多线程安全）
+//
+// ★ 多线程安全设计（解决多个应用线程并发写 Ring Buffer 的问题）：
+//    使用 _padding 字段作为 valid 标志：
+//      1. ZeroMemory() 将 _padding 置 0（无效状态）
+//      2. 写入所有数据字段
+//      3. MemoryBarrier() 确保所有写入对其他核心可见
+//      4. _padding = 1（标记为有效）
+//    Rust 读取方先检查 _padding，为 0 则跳过（部分写入/空槽位）
+//    x86/x64 保证正常存储的 store-store 顺序，MemoryBarrier() 防止编译器重排
 // ============================================================================
 
 void AuditLog(AuditEventType type, const std::wstring& target,
@@ -87,16 +96,16 @@ void AuditLog(AuditEventType type, const std::wstring& target,
         uint32_t slotCount = g_ringHeader->slot_count;
         if (slotCount == 0 || slotCount > AUDIT_RING_SLOTS) goto fallback;
 
-        // 原子的读取 write_cursor 并递增（单生产者，InterlockedIncrement 即可）
+        // ★ 多线程安全：InterlockedIncrement 确保每个线程获得唯一槽位
         uint32_t writePos = InterlockedIncrement(&g_ringHeader->write_cursor) - 1;
         uint32_t readPos = g_ringHeader->read_cursor;
 
-        // 检查是否追上读者（buffer full）
+        // ★ 检查是否追上读者（buffer full）
+        //    注意：多线程下 writePos - readPos 可能短暂超过 slotCount
+        //    但这是安全的上界，丢掉溢出事件比覆盖未读槽位更安全
         if (writePos - readPos >= slotCount) {
-            // 溢出：更新溢出计数，丢弃本次事件
             InterlockedIncrement(&g_ringHeader->overflow_count);
-            // 回退 write_cursor（尽力而为）
-            InterlockedCompareExchange(&g_ringHeader->write_cursor, readPos + slotCount, writePos + 1);
+            // ★ 不再尝试回退 write_cursor（多线程下 CAS 回退不可靠）
             return;
         }
 
@@ -104,7 +113,10 @@ void AuditLog(AuditEventType type, const std::wstring& target,
         uint32_t slotIdx = writePos % slotCount;
         AuditEventC* slot = &g_ringSlots[slotIdx];
 
+        // ★ 第1步：置为无效（_padding = 0）
         ZeroMemory(slot, sizeof(AuditEventC));
+
+        // ★ 第2步：写入所有数据字段
         slot->event_type = static_cast<uint32_t>(type);
         slot->pid = GetCurrentProcessId();
         slot->timestamp_ms = GetTickCount() - g_dllLoadTimeMs;
@@ -112,6 +124,10 @@ void AuditLog(AuditEventType type, const std::wstring& target,
         wcsncpy_s(slot->detail, 128, detail.c_str(), _TRUNCATE);
         slot->access_mask = accessMask;
         slot->nt_status = ntStatus;
+
+        // ★ 第3步：内存屏障 + 标记为有效（确保所有数据写入在 _padding=1 之前可见）
+        MemoryBarrier();
+        slot->_padding = 1;
 
         return;
     }

@@ -28,7 +28,7 @@
 
 bool InitHookEngine() {
     InitializeCriticalSection(&g_track_cs);
-    g_tracked.reserve(64);
+    // std::list 不需要预分配（reserve）
 
     // ★ 注册 VEH 作为安全网（在 hook_crash.cpp 中实现）
     // VEH 覆盖：trampoline 访问违规 + CLR /GS 崩溃

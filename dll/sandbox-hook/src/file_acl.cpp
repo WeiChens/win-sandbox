@@ -6,6 +6,7 @@
 #include "ipc_client.h"
 #include "utils.h"
 #include <windows.h>
+#include <shlobj.h>      // SHGetFolderPathW, CSIDL_PROGRAM_FILES
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -69,7 +70,7 @@ static std::string JsonGetString(const std::string& json, const char* key, size_
 
 static FilePermission ParsePermission(const std::string& perm) {
     if (perm == "deny" || perm == "DENY") return FilePermission::Deny;
-    if (perm == "read_only" || perm == "read_only" || perm == "READ_ONLY") return FilePermission::ReadOnly;
+    if (perm == "read_only" || perm == "READ_ONLY") return FilePermission::ReadOnly;
     return FilePermission::Inherit;
 }
 
@@ -148,8 +149,10 @@ FilePermission CheckFilePermission(const std::wstring& path) {
         }
     }
 
-    // 无匹配规则：默认 ReadOnly（安全优先）
-    return FilePermission::ReadOnly;
+    // 无匹配规则：默认 Inherit（完全放行）
+    // ★ 注意：如果规则列表为空（配置缺失），所有路径全部放行。
+    //   如果希望安全优先，可在配置中添加顶级 deny 规则。
+    return FilePermission::Inherit;
 }
 
 // ============================================================================
@@ -499,17 +502,66 @@ FilePermission CheckFilePermissionWithSymlink(const std::wstring& path) {
 // 修复：在检查 ACL 前，将重定向后的路径映射回原始路径。
 // ============================================================================
 
-/// WOW64 路径映射规则
+/// WOW64 路径映射规则（运行时动态初始化，支持非 C: 盘安装的 Windows）
 struct Wow64RedirectRule {
-    const wchar_t* redirected;   // 重定向后的前缀（如 SysWOW64）
-    const wchar_t* original;     // 原始前缀（如 System32）
+    std::wstring redirected;   // 重定向后的前缀（如 SysWOW64）
+    std::wstring original;     // 原始前缀（如 System32）
 };
 
-static const Wow64RedirectRule g_wow64Rules[] = {
-    { L"C:\\WINDOWS\\SYSWOW64\\", L"C:\\WINDOWS\\SYSTEM32\\" },
-    { L"C:\\WINDOWS\\SYSNATIVE\\", L"C:\\WINDOWS\\SYSTEM32\\" },
-    { L"C:\\PROGRAM FILES (X86)\\", L"C:\\PROGRAM FILES\\" },
-};
+static std::vector<Wow64RedirectRule> g_wow64Rules;
+static bool g_wow64RulesInitialized = false;
+
+// ★ 重入守卫：SHGetFolderPathW/GetSystemWindowsDirectoryW 可能触发文件 Hook
+//   导致 WowPathRedirectIfNeed 重入。用 TLS 防止死锁。
+static DWORD g_tls_wow64_init = TLS_OUT_OF_INDEXES;
+
+static bool EnterWow64Init() {
+    if (g_tls_wow64_init == TLS_OUT_OF_INDEXES) {
+        g_tls_wow64_init = TlsAlloc();
+        if (g_tls_wow64_init == TLS_OUT_OF_INDEXES) return false;
+    }
+    if (TlsGetValue(g_tls_wow64_init) != 0) return false;
+    TlsSetValue(g_tls_wow64_init, (LPVOID)1);
+    return true;
+}
+
+static void LeaveWow64Init() {
+    if (g_tls_wow64_init != TLS_OUT_OF_INDEXES)
+        TlsSetValue(g_tls_wow64_init, (LPVOID)0);
+}
+
+/// 初始化 WOW64 映射规则（根据实际 Windows 路径动态构建）
+/// 使用 TLS 重入守卫，防止 SHGetFolderPathW 等触发文件 Hook 导致的递归
+static void InitWow64RedirectRules() {
+    if (!EnterWow64Init()) return;  // 已重入，跳过（仍会用默认空规则）
+    if (g_wow64RulesInitialized) { LeaveWow64Init(); return; }
+
+    // 获取 Windows 目录（如 C:\Windows 或 D:\Windows）
+    wchar_t winDir[MAX_PATH] = {0};
+    if (GetSystemWindowsDirectoryW(winDir, MAX_PATH) == 0) {
+        wcscpy_s(winDir, L"C:\\Windows");
+    }
+    std::wstring winDirUpper(winDir);
+    std::transform(winDirUpper.begin(), winDirUpper.end(), winDirUpper.begin(), ::towupper);
+    // winDirUpper = "C:\\WINDOWS" (无末尾反斜杠)
+
+    // 获取 Program Files 目录
+    wchar_t progFiles[MAX_PATH] = {0};
+    if (SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr, 0, progFiles) == 0) {
+        std::transform(progFiles, progFiles + wcslen(progFiles), progFiles, ::towupper);
+    } else {
+        wcscpy_s(progFiles, L"C:\\PROGRAM FILES");
+    }
+    std::wstring pfDir(progFiles);
+
+    g_wow64Rules.clear();
+    g_wow64Rules.push_back({ winDirUpper + L"\\SYSWOW64\\", winDirUpper + L"\\SYSTEM32\\" });
+    g_wow64Rules.push_back({ winDirUpper + L"\\SYSNATIVE\\", winDirUpper + L"\\SYSTEM32\\" });
+    g_wow64Rules.push_back({ pfDir + L" (X86)\\", pfDir + L"\\" });
+
+    g_wow64RulesInitialized = true;
+    LeaveWow64Init();
+}
 
 /// 如果当前进程是 WOW64 (x86)，将路径从重定向后的格式映射回原始格式
 /// 以匹配 ACL 规则中的路径
@@ -530,10 +582,15 @@ std::wstring WowPathRedirectIfNeed(const std::wstring& path) {
         return path;  // x64 进程，不需要重定向
     }
 
+    // 延迟初始化规则
+    if (!g_wow64RulesInitialized) {
+        InitWow64RedirectRules();
+    }
+
     // 对 WOW64 进程：将重定向路径映射回原始路径
     for (const auto& rule : g_wow64Rules) {
-        size_t prefixLen = wcslen(rule.redirected);
-        if (_wcsnicmp(path.c_str(), rule.redirected, prefixLen) == 0) {
+        size_t prefixLen = rule.redirected.length();
+        if (_wcsnicmp(path.c_str(), rule.redirected.c_str(), prefixLen) == 0) {
             // 替换前缀
             std::wstring result = rule.original;
             result += path.substr(prefixLen);

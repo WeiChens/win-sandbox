@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <list>
 #include <mutex>
 #include <algorithm>
 
@@ -32,7 +33,7 @@ typedef LONG NTSTATUS;
 // ============================================================================
 
 std::atomic<bool> g_dll_detaching{false};
-std::vector<TrackedProcess> g_tracked;
+std::list<TrackedProcess> g_tracked;
 CRITICAL_SECTION g_track_cs;
 
 // DLL 路径缓存

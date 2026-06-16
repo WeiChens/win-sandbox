@@ -89,18 +89,13 @@ typedef struct _MY_FILE_FULL_DIR_INFORMATION {
     WCHAR  FileName[1];
 } MY_FILE_FULL_DIR_INFORMATION;
 
+// ★ FILE_NAMES_INFORMATION 官方定义只有 NextEntryOffset + FileIndex + FileNameLength + FileName
+//   之前的定义多了 7 个 LARGE_INTEGER 字段（56 字节），导致 FilterDeniedEntries 中偏移计算全错
 typedef struct _MY_FILE_NAMES_INFORMATION {
     ULONG  NextEntryOffset;
     ULONG  FileIndex;
-    LARGE_INTEGER CreationTime;  // 在 FileNamesInformation 中没有这个字段，但为了简化我们不使用
-    LARGE_INTEGER LastAccessTime;
-    LARGE_INTEGER LastWriteTime;
-    LARGE_INTEGER ChangeTime;
-    LARGE_INTEGER EndOfFile;
-    LARGE_INTEGER AllocationSize;
-    ULONG  FileAttributes;
-    ULONG  FileNameLength;
-    WCHAR  FileName[1];
+    ULONG  FileNameLength;     // 字节数
+    WCHAR  FileName[1];        // 变长数组
 } MY_FILE_NAMES_INFORMATION;
 #pragma pack(pop)
 
@@ -190,10 +185,9 @@ static NTSTATUS WINAPI Hook_NtCreateFile(
 
     FilePermission perm;
     if (IsAclInitialized()) {
-        bool existingFile = (CreateDisposition != FILE_CREATE);
-        perm = existingFile
-            ? CheckFilePermissionWithSymlink(pathStr)
-            : CheckFilePermission(pathStr);
+        // ★ 始终使用 CheckFilePermissionWithSymlink（含 WOW64 重定向 + 符号链接解析）
+        //    FILE_CREATE 时文件虽不存在，但 WOW64 重定向仍然需要
+        perm = CheckFilePermissionWithSymlink(pathStr);
     } else {
         perm = FilePermission::Inherit;
     }
@@ -205,15 +199,7 @@ static NTSTATUS WINAPI Hook_NtCreateFile(
         return STATUS_ACCESS_DENIED;
     }
 
-    // ★ Deny 路径也要检查 FILE_DELETE_ON_CLOSE（防 DeleteFileW 绕过）
-    if (perm == FilePermission::Deny && (CreateOptions & 0x00001000)) {
-        AuditLog(AuditEventType::FileDeny, pathStr, L"deny_delete_on_close",
-                 CreateOptions, STATUS_ACCESS_DENIED);
-        if (FileHandle) *FileHandle = nullptr;
-        SetLastError(ERROR_ACCESS_DENIED);
-        return STATUS_ACCESS_DENIED;
-    }
-
+    // ★ ReadOnly + FILE_DELETE_ON_CLOSE → 拒绝（防 DeleteFileW 绕过）
     if (perm == FilePermission::ReadOnly) {
         DWORD writeFlags = GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA
                          | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE;
