@@ -54,8 +54,17 @@ void InstallAllHooks() {
     InstallNtResumeThreadHook();
     InstallNetHooks();
 
-    // InstallCorExitProcessHook();  // 仅 .NET 进程生效，安全
-    // InstallCrashHandlerHook();     // SetUnhandledExceptionFilter 有 /GS 栈保护，自研引擎无法 Hook
+    // ★ CorExitProcess Hook — 拦截 .NET CLR 进程退出，刷出审计
+    // 暂时禁用：在某些 .NET 版本上导致 ACCESS_VIOLATION (0xC0000005)
+    // InstallCorExitProcessHook();
+
+    // ★ CorExitProcess Hook — 拦截 .NET CLR 进程退出，刷出审计
+    // 暂时禁用：在某些 .NET 版本上可能导致兼容性问题
+    // InstallCorExitProcessHook();
+
+    // ★ SetUnhandledExceptionFilter Hook — 崩溃前刷出审计
+    //    使用 __try/__except 保护，防止自身崩溃
+    InstallCrashHandlerHook();
 
     AuditLog(AuditEventType::ProcessCreate, L"", L"all_hooks_installed", 0, 0);
 }

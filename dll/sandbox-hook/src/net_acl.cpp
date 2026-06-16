@@ -373,6 +373,117 @@ static int WSAAPI Hook_WSAConnect(SOCKET s, const sockaddr* name, int namelen,
 }
 
 // ============================================================================
+// WSAIoctl Hook — 拦截 SIO_GET_EXTENSION_FUNCTION_POINTER (ConnectEx)
+// ============================================================================
+
+// WSAID_CONNECTEX GUID
+const GUID GUID_CONNECTEX = {0x25a207b9, 0xdbb3, 0x4a90, {0xb0, 0x4b, 0x87, 0x4e, 0x6f, 0x6e, 0xd0, 0x17}};
+
+#ifndef SIO_GET_EXTENSION_FUNCTION_POINTER
+#define SIO_GET_EXTENSION_FUNCTION_POINTER 0xC8000006
+#endif
+
+// ConnectEx 函数指针类型
+typedef BOOL (WINAPI *PFN_CONNECTEX)(SOCKET s, const sockaddr* name, int namelen,
+    PVOID lpSendBuffer, DWORD dwSendDataLength, LPDWORD lpdwBytesSent,
+    LPWSAOVERLAPPED lpOverlapped);
+
+static PFN_CONNECTEX Real_ConnectEx = nullptr;
+
+/// 包装的 ConnectEx — 在连接前检查 ACL
+static BOOL WINAPI Hook_ConnectEx(SOCKET s, const sockaddr* name, int namelen,
+    PVOID lpSendBuffer, DWORD dwSendDataLength, LPDWORD lpdwBytesSent,
+    LPWSAOVERLAPPED lpOverlapped)
+{
+    if (!Real_ConnectEx) {
+        WSASetLastError(WSAEACCES);
+        return FALSE;
+    }
+
+    if (name && namelen >= (int)sizeof(sockaddr_in)) {
+        const auto* sin = reinterpret_cast<const sockaddr_in*>(name);
+        if (sin->sin_family == AF_INET) {
+            char ipBuf[64];
+            inet_ntop(AF_INET, &sin->sin_addr, ipBuf, sizeof(ipBuf));
+            uint16_t port = ntohs(sin->sin_port);
+
+            if (!CheckNetPermission(ipBuf, port, NetProtocol::Tcp)) {
+                AuditLog(AuditEventType::NetDeny, Utf8ToWide(ipBuf),
+                         L"deny_connectex", port, STATUS_ACCESS_DENIED);
+                WSASetLastError(WSAEACCES);
+                return FALSE;
+            }
+
+            AuditLog(AuditEventType::NetAllow, Utf8ToWide(ipBuf),
+                     L"allow_connectex", port, 0);
+        }
+    }
+
+    return Real_ConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength,
+                          lpdwBytesSent, lpOverlapped);
+}
+
+typedef int (WSAAPI *PFN_WSAIoctl)(
+    SOCKET s, DWORD dwIoControlCode, LPVOID lpvInBuffer,
+    DWORD cbInBuffer, LPVOID lpvOutBuffer, DWORD cbOutBuffer,
+    LPDWORD lpcbBytesReturned, LPWSAOVERLAPPED lpOverlapped,
+    LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine);
+
+static PFN_WSAIoctl Real_WSAIoctl = nullptr;
+
+/// 检查是否是 ConnectEx 的 GUID 查询（安全版，带空指针和长度检查）
+static bool IsConnectExRequest(const void* inBuf, DWORD inBufLen) {
+    if (!inBuf || inBufLen < (DWORD)sizeof(GUID)) return false;
+    __try {
+        return memcmp(inBuf, &GUID_CONNECTEX, sizeof(GUID)) == 0;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;  // 非法内存访问，安全降级
+    }
+}
+
+static int WSAAPI Hook_WSAIoctl(
+    SOCKET s, DWORD dwIoControlCode, LPVOID lpvInBuffer,
+    DWORD cbInBuffer, LPVOID lpvOutBuffer, DWORD cbOutBuffer,
+    LPDWORD lpcbBytesReturned, LPWSAOVERLAPPED lpOverlapped,
+    LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine)
+{
+    if (!Real_WSAIoctl) {
+        WSASetLastError(WSAEACCES);
+        return SOCKET_ERROR;
+    }
+
+    // ★ 拦截 SIO_GET_EXTENSION_FUNCTION_POINTER 请求
+    //    仅在所有参数有效时才介入，否则透传
+    if (dwIoControlCode == SIO_GET_EXTENSION_FUNCTION_POINTER &&
+        lpvInBuffer && cbInBuffer >= sizeof(GUID) &&
+        lpvOutBuffer && cbOutBuffer >= sizeof(PVOID) &&
+        IsConnectExRequest(lpvInBuffer, cbInBuffer)) {
+
+        // 先调用原始的 WSAIoctl 获取真实的 ConnectEx 指针
+        int ret = Real_WSAIoctl(s, dwIoControlCode, lpvInBuffer, cbInBuffer,
+                                lpvOutBuffer, cbOutBuffer, lpcbBytesReturned,
+                                lpOverlapped, lpCompletionRoutine);
+
+        if (ret == 0 && lpcbBytesReturned && *lpcbBytesReturned >= sizeof(PVOID)) {
+            // 保存真实的 ConnectEx 指针
+            Real_ConnectEx = *(PFN_CONNECTEX*)lpvOutBuffer;
+
+            // ★ 返回我们的包装函数指针
+            *(PFN_CONNECTEX*)lpvOutBuffer = Hook_ConnectEx;
+
+            OutputDebugStringA("[sandbox_hook] WSAIoctl: ConnectEx hooked\n");
+        }
+
+        return ret;
+    }
+
+    // 其他 IOCTL 请求透传
+    return Real_WSAIoctl(s, dwIoControlCode, lpvInBuffer, cbInBuffer,
+                         lpvOutBuffer, cbOutBuffer, lpcbBytesReturned,
+                         lpOverlapped, lpCompletionRoutine);
+}
+
+// ============================================================================
 // DNS Hook 函数 — 防止 DnsQuery_* 绕过 getaddrinfo
 // ============================================================================
 
@@ -552,6 +663,13 @@ static int WSAAPI Hook_WSAStartup(WORD wVersionRequested, LPWSADATA lpWSAData) {
             if (wsaConnectTarget) {
                 auto* tramp = (BYTE*)DetourInstall(wsaConnectTarget, (BYTE*)Hook_WSAConnect, "WSAConnect");
                 if (tramp) Real_WSAConnect = (PFN_WSAConnect)tramp;
+            }
+
+                    // ★ WSAIoctl — 拦截 ConnectEx 获取，防止绕过 connect/WSAConnect
+            auto* wsaIoctlTarget = (BYTE*)GetProcAddress(hWs2, "WSAIoctl");
+            if (wsaIoctlTarget) {
+                auto* tramp = (BYTE*)DetourInstall(wsaIoctlTarget, (BYTE*)Hook_WSAIoctl, "WSAIoctl");
+                if (tramp) Real_WSAIoctl = (PFN_WSAIoctl)tramp;
             }
         }
     }

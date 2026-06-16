@@ -475,12 +475,73 @@ static std::wstring ResolveSymbolicLink(const std::wstring& path, int depth = 0)
     return ResolveSymbolicLink(resolved, depth + 1);
 }
 
-/// 检查文件权限（含符号链接绕过检测）
-/// 先解析符号链接至最终目标，再对最终目标做 ACL 检查（含硬链接防护）
+/// 检查文件权限（含符号链接 + WOW64 重定向 + 硬链接防护）
+/// 先解析符号链接至最终目标，再对 WOW64 路径做逆向映射，
+/// 最后对最终目标做 ACL 检查（含硬链接防护）
 FilePermission CheckFilePermissionWithSymlink(const std::wstring& path) {
     // 先解析符号链接
     std::wstring resolvedPath = ResolveSymbolicLink(path);
 
+    // 对 WOW64 进程做 SysWOW64→System32 逆向映射
+    std::wstring normalizedPath = WowPathRedirectIfNeed(resolvedPath);
+
     // 对解析后的路径做 ACL 检查（含硬链接防护）
-    return CheckFilePermissionWithHardLinks(resolvedPath);
+    return CheckFilePermissionWithHardLinks(normalizedPath);
 }
+
+// ============================================================================
+// WOW64 路径重定向修复
+//
+// x86 (WOW64) 进程访问 C:\Windows\System32\... 时，
+// WOW64 文件系统重定向器自动将路径重定向到 C:\Windows\SysWOW64\...
+// 这意味着 ACL 规则中的 System32 路径对 x86 进程不生效。
+//
+// 修复：在检查 ACL 前，将重定向后的路径映射回原始路径。
+// ============================================================================
+
+/// WOW64 路径映射规则
+struct Wow64RedirectRule {
+    const wchar_t* redirected;   // 重定向后的前缀（如 SysWOW64）
+    const wchar_t* original;     // 原始前缀（如 System32）
+};
+
+static const Wow64RedirectRule g_wow64Rules[] = {
+    { L"C:\\WINDOWS\\SYSWOW64\\", L"C:\\WINDOWS\\SYSTEM32\\" },
+    { L"C:\\WINDOWS\\SYSNATIVE\\", L"C:\\WINDOWS\\SYSTEM32\\" },
+    { L"C:\\PROGRAM FILES (X86)\\", L"C:\\PROGRAM FILES\\" },
+};
+
+/// 如果当前进程是 WOW64 (x86)，将路径从重定向后的格式映射回原始格式
+/// 以匹配 ACL 规则中的路径
+std::wstring WowPathRedirectIfNeed(const std::wstring& path) {
+    // 检查当前进程是否为 WOW64
+    static bool s_isWow64Checked = false;
+    static bool s_isWow64 = false;
+    
+    if (!s_isWow64Checked) {
+        BOOL isWow64 = FALSE;
+        if (IsWow64Process(GetCurrentProcess(), &isWow64)) {
+            s_isWow64 = (isWow64 != FALSE);
+        }
+        s_isWow64Checked = true;
+    }
+    
+    if (!s_isWow64) {
+        return path;  // x64 进程，不需要重定向
+    }
+
+    // 对 WOW64 进程：将重定向路径映射回原始路径
+    for (const auto& rule : g_wow64Rules) {
+        size_t prefixLen = wcslen(rule.redirected);
+        if (_wcsnicmp(path.c_str(), rule.redirected, prefixLen) == 0) {
+            // 替换前缀
+            std::wstring result = rule.original;
+            result += path.substr(prefixLen);
+            return result;
+        }
+    }
+
+    return path;
+}
+
+

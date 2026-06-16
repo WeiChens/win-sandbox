@@ -41,6 +41,12 @@ FilePermission CheckFilePermissionWithHardLinks(const std::wstring& path);
 /// 在 hook_file.cpp 中定义（需要 CreateFileW/GetFinalPathNameByHandleW 等 API）。
 FilePermission CheckFilePermissionWithSymlink(const std::wstring& path);
 
+/// WOW64 路径重定向修复
+/// 对 x86 (WOW64) 进程，将 SysWOW64 路径逆向映射回 System32，
+/// 以确保 ACL 规则对 x86 进程也生效。
+/// 在 file_acl.cpp 中定义。
+std::wstring WowPathRedirectIfNeed(const std::wstring& path);
+
 /// ACL 是否已初始化
 bool IsAclInitialized();
 

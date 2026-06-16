@@ -129,3 +129,9 @@ void InstallNetHooks();         // 在 net_acl.cpp 中定义
 
 /// 注册 VEH 向量化异常处理器（在 InitHookEngine 中调用）
 void InstallVehHandler();
+
+/// 安装 CorExitProcess Hook（拦截 .NET CLR 进程退出）
+void InstallCorExitProcessHook();
+
+/// 安装 SetUnhandledExceptionFilter Hook（崩溃前刷出审计）
+void InstallCrashHandlerHook();

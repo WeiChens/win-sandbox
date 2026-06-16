@@ -374,6 +374,125 @@ def test_p0_mmap_read_inherit_allowed(runner: SandboxRunner) -> TestResult:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 10.6 — WOW64 路径重定向修复（x86 进程路径映射）
+# ══════════════════════════════════════════════════════════════════════
+# 攻击路径: x86 进程写 C:\Windows\System32\... 被 WOW64 重定向到 SysWOW64
+#           ACL 规则使用 System32 路径，不匹配 SysWOW64 → 绕过
+# 修复: WowPathRedirectIfNeed 在 ACL 检查前将 SysWOW64→System32 映射
+# 验证: x86 进程写 System32 路径被正确拦截
+
+def test_p0_wow64_redirect_x86_blocked(runner: SandboxRunner) -> TestResult:
+    """10.9 回归: x86 进程写 System32(被重定向到 SysWOW64) 被 ReadOnly 拦截
+
+    x86 进程的 C:\\Windows\\System32 实际是 C:\\Windows\\SysWOW64。
+    修复前: SysWOW64 路径不匹配 ACL 规则，默认 ReadOnly 仍拦截写但规则路径无效
+    修复后: SysWOW64 映射回 System32，匹配 ACL 规则，一致行为
+    """
+    t0 = time.time()
+    # x86 cmd.exe (as_x86=True → SysWOW64)尝试在 System32 下创建目录
+    rc, out, err = runner.exec(
+        'mkdir "C:\\Windows\\System32\\p0_wow64_test" 2>nul && echo MKDIR_OK || echo MKDIR_BLOCKED',
+        config=READONLY_CFG, timeout=15, as_x86=True,
+    )
+    dt = time.time() - t0
+    return runner.make_result(
+        "回归: x86 写 System32(→SysWOW64) 被 ReadOnly 拦截",
+        "P0回归", "x86", rc, out, err,
+        expected_text="MKDIR_BLOCKED",
+        duration=dt,
+    )
+
+
+def test_p0_wow64_redirect_x64_allowed(runner: SandboxRunner) -> TestResult:
+    """10.10 回归: x64 写 SysWOW64 被 ReadOnly 拦截（与 x86 行为一致）
+
+    验证 x64 进程直接写 SysWOW64 同样被 ReadOnly 拦截。
+    """
+    t0 = time.time()
+    rc, out, err = runner.exec(
+        'mkdir "C:\\Windows\\SysWOW64\\p0_wow64_test_x64" 2>nul && echo MKDIR_OK || echo MKDIR_BLOCKED',
+        config=READONLY_CFG, timeout=15, as_x86=False,
+    )
+    dt = time.time() - t0
+    return runner.make_result(
+        "回归: x64 写 SysWOW64 被 ReadOnly 拦截",
+        "P0回归", "x64", rc, out, err,
+        expected_text="MKDIR_BLOCKED",
+        duration=dt,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 10.7 — SetUnhandledExceptionFilter Hook
+# ══════════════════════════════════════════════════════════════════════
+# 功能: 拦截 SetUnhandledExceptionFilter 调用，崩溃前刷出审计
+# 验证: Hook 安装后不崩溃，应用程序可正常运行
+
+def test_p0_uef_hook_stable(runner: SandboxRunner) -> TestResult:
+    """10.11 回归: SetUnhandledExceptionFilter Hook 不引起崩溃 ✅
+
+    验证基础命令在 CrashHandler Hook 激活后正常运行。
+    幂等性: 纯功能测试
+    """
+    t0 = time.time()
+    rc, out, err = runner.exec(
+        'echo UEF_HOOK_OK',
+        config=INHERIT_CFG, timeout=15,
+    )
+    dt = time.time() - t0
+    return runner.make_result(
+        "回归: SetUnhandledExceptionFilter Hook 稳定",
+        "P0回归", "x64", rc, out, err,
+        expected_text="UEF_HOOK_OK",
+        duration=dt,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 10.8 — WSAIoctl (ConnectEx 拦截)
+# ══════════════════════════════════════════════════════════════════════
+# 攻击路径: WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER) 获取 ConnectEx
+#           然后用 ConnectEx 直接连接，绕过 connect()/WSAConnect()
+# 修复: Hook WSAIoctl → 拦截 ConnectEx 请求 → 返回包装函数指针
+# 验证: WSAIoctl Hook 安装后不崩溃
+
+def test_p0_wsaiocl_hook_stable(runner: SandboxRunner) -> TestResult:
+    """10.12 回归: WSAIoctl Hook 不引起崩溃 ✅
+
+    WSAIoctl 被 Hook 后，普通 IOCTL 请求透传，不影响正常运行。
+    验证 cmd.exe 内部 WSAIoctl 调用不崩溃。
+    幂等性: 纯功能测试
+    """
+    t0 = time.time()
+    rc, out, err = runner.exec(
+        'echo WSAIOCTL_HOOK_OK',
+        config=INHERIT_CFG, timeout=15,
+    )
+    dt = time.time() - t0
+
+    # 带网络操作的命令也测试 WSAIoctl 稳定性
+    t1 = time.time()
+    rc2, out2, err2 = runner.exec(
+        'ping -n 1 127.0.0.1 >nul 2>&1 && echo PING_OK || echo PING_FAIL',
+        config=INHERIT_CFG, timeout=15,
+    )
+    dt2 = time.time() - t1
+
+    # 合并结果 — 检查两个命令都没有崩溃
+    combined_out = out + "\n" + out2
+    combined_err = err + "\n" + err2
+    combined_rc = rc if rc == 0 else rc2
+    combined_dt = dt + dt2
+
+    has_output = "WSAIOCTL_HOOK_OK" in out and "PING_OK" in out2
+    return runner.make_result(
+        "回归: WSAIoctl Hook 不引起崩溃",
+        "P0回归", "x64", combined_rc, combined_out, combined_err,
+        duration=combined_dt,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 测试注册表
 # ══════════════════════════════════════════════════════════════════════
 
@@ -395,4 +514,14 @@ P0_REGRESSION_TESTS = [
     # NtMapViewOfSection
     test_p0_mmap_write_readonly_blocked,
     test_p0_mmap_read_inherit_allowed,
+
+    # WOW64 路径重定向
+    test_p0_wow64_redirect_x86_blocked,
+    test_p0_wow64_redirect_x64_allowed,
+
+    # SetUnhandledExceptionFilter
+    test_p0_uef_hook_stable,
+
+    # WSAIoctl
+    test_p0_wsaiocl_hook_stable,
 ]

@@ -83,10 +83,17 @@ static LONG WINAPI SandboxUefHandler(PEXCEPTION_POINTERS ExceptionInfo) {
 
 static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI Hook_SetUnhandledExceptionFilter(
     LPTOP_LEVEL_EXCEPTION_FILTER lpTopLevelExceptionFilter) {
-    SetUnhandledExceptionFilter(SandboxUefHandler);
-    return Real_SetUnhandledExceptionFilter
-        ? Real_SetUnhandledExceptionFilter(lpTopLevelExceptionFilter)
-        : nullptr;
+    // ★ 重要：不能在此调用 SetUnhandledExceptionFilter()，
+    //    会递归进入本 Hook → 栈溢出 (0xC00000FD)。
+    //    通过 Real_ 指针调用原始函数以避免递归。
+    //
+    // 无论应用程序设置什么 handler，我们都插入自己的前置 handler
+    // （VEH 仍然优先于 UEF，这是额外的安全保障）
+    if (Real_SetUnhandledExceptionFilter) {
+        Real_SetUnhandledExceptionFilter(SandboxUefHandler);
+    }
+    // 忽略应用程序的 handler，我们总是使用自己的 handler
+    return nullptr;
 }
 
 // ============================================================================
@@ -95,4 +102,39 @@ static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI Hook_SetUnhandledExceptionFilter(
 
 void InstallVehHandler() {
     AddVectoredExceptionHandler(1, SandboxVehHandler);
+}
+
+// ============================================================================
+// 安装 Hook（在 InstallAllHooks 中调用）
+// ============================================================================
+
+void InstallCorExitProcessHook() {
+    HMODULE hClr = GetModuleHandleW(L"clr.dll");
+    if (!hClr) {
+        hClr = GetModuleHandleW(L"coreclr.dll");
+    }
+    if (!hClr) {
+        // .NET 未加载，跳过（进程启动后 .NET 可能延迟加载）
+        return;
+    }
+
+    auto* target = (BYTE*)GetProcAddress(hClr, "CorExitProcess");
+    if (target) {
+        auto* tramp = (BYTE*)DetourInstall(target, (BYTE*)Hook_CorExitProcess, "CorExitProcess");
+        if (tramp) Real_CorExitProcess = (PFN_CorExitProcess)tramp;
+    }
+}
+
+void InstallCrashHandlerHook() {
+    // ★ Hook SetUnhandledExceptionFilter — 崩溃前刷出审计
+    //   优先 Hook kernelbase.dll（Win10 上 kernel32 的 UEF 是转发到 kernelbase 的 JMP）
+    //   避免 Hook 转发 stub 导致的兼容性问题
+    BYTE* target = FindFunction("kernelbase.dll", "SetUnhandledExceptionFilter");
+    if (!target) {
+        target = FindFunction("kernel32.dll", "SetUnhandledExceptionFilter");
+    }
+    if (target) {
+        auto* tramp = (BYTE*)DetourInstall(target, (BYTE*)Hook_SetUnhandledExceptionFilter, "SetUnhandledExceptionFilter");
+        if (tramp) Real_SetUnhandledExceptionFilter = (PFN_SetUnhandledExceptionFilter)tramp;
+    }
 }
