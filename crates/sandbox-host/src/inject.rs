@@ -254,6 +254,31 @@ pub fn read_pipe_to_end(h_pipe: HANDLE) -> String {
     String::from_utf8_lossy(&result).to_string()
 }
 
+/// 从管道读取数据流，每读取一块就调用一次回调函数
+///
+/// 管道句柄通过 `usize` 传递（`HANDLE` 不是 `Send`，无法跨线程直接传递）。
+/// 当管道关闭（子进程退出）或回调返回 `Err` 时停止读取并关闭句柄。
+pub fn read_pipe_stream<F>(h_pipe: usize, mut on_chunk: F)
+where
+    F: FnMut(Vec<u8>) -> Result<(), ()>,
+{
+    let pipe = h_pipe as HANDLE;
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let mut nread: DWORD = 0;
+        let ret = unsafe {
+            ReadFile(pipe, buf.as_mut_ptr(), buf.len() as DWORD, &mut nread, std::ptr::null_mut())
+        };
+        if ret == 0 || nread == 0 {
+            break;
+        }
+        if on_chunk(buf[..nread as usize].to_vec()).is_err() {
+            break; // 接收端已丢弃
+        }
+    }
+    unsafe { CloseHandle(pipe); }
+}
+
 // ============================================================================
 // ★ WOW64 LoadLibraryW 地址解析
 //
