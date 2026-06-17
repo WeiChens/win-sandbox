@@ -2,7 +2,14 @@
 name = "sandbox-host"
 version = "0.1.0"
 edition = "2021"
-description = "Windows Sandbox — Rust host process (local CLI)"
+description = "Windows Sandbox — Rust host process (library + CLI)"
+
+[lib]
+name = "sandbox_host"
+
+[[bin]]
+name = "sandbox-host"
+path = "src/main.rs"
 
 [dependencies]
 sandbox-core = { path = "../sandbox-core" }

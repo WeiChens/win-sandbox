@@ -483,6 +483,7 @@ pub fn create_and_inject(
     args: &[String],
     dll_path_x64: &str,
     dll_path_x86: &str,
+    helper_path: &str,
     config: &SandboxConfig,
     ipc: &IpcServer,
     pipes: Option<(HANDLE, HANDLE)>,  // (stdout_write, stderr_write)
@@ -572,7 +573,7 @@ pub fn create_and_inject(
     log::info!("架构: {}, DLL: {}", if is_wow64 { "x86" } else { "x64" }, actual_dll);
 
     // 注入（自动选择正确的 LoadLibraryW 地址）
-    inject_dll(pi.hProcess, actual_dll, is_wow64, pi.dwProcessId)?;
+    inject_dll(pi.hProcess, actual_dll, is_wow64, pi.dwProcessId, helper_path)?;
 
     // 恢复
     unsafe { ResumeThread(pi.hThread); CloseHandle(pi.hThread); }
@@ -592,12 +593,12 @@ fn is_process_wow64(process: HANDLE) -> Result<bool, Box<dyn std::error::Error>>
     Ok(wow64 != 0)
 }
 
-fn inject_dll(process: HANDLE, dll_path: &str, is_wow64: bool, target_pid: DWORD) -> Result<(), Box<dyn std::error::Error>> {
+fn inject_dll(process: HANDLE, dll_path: &str, is_wow64: bool, target_pid: DWORD, helper_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     if is_wow64 {
         // ★ WOW64 注入: 使用 32-bit 辅助进程（Trae 方案）
         // 64-bit GetProcAddress(LoadLibraryW) 返回的地址在 32-bit 进程中无效
         // 改用 32-bit 辅助进程（sandbox_helper_x86.exe）执行注入
-        return inject_via_helper(dll_path, target_pid);
+        return inject_via_helper(dll_path, target_pid, helper_path);
     }
 
     // ★ x64 注入: 直接 CreateRemoteThread（64-bit LoadLibraryW 地址正确）
@@ -670,23 +671,18 @@ fn inject_dll(process: HANDLE, dll_path: &str, is_wow64: bool, target_pid: DWORD
 /// Trae 方案：64-bit 进程无法获取正确的 32-bit LoadLibraryW 地址，
 /// 因此创建一个 32-bit 辅助进程来执行注入。
 /// 32-bit 进程的 GetProcAddress(kernel32, "LoadLibraryW") 返回正确的 32-bit 地址。
-fn inject_via_helper(dll_path: &str, target_pid: DWORD) -> Result<(), Box<dyn std::error::Error>> {
-    // 辅助程序路径（与 sandbox-host.exe 同目录）
-    let exe_dir = std::env::current_exe()?
-        .parent().unwrap_or(std::path::Path::new("."))
-        .to_path_buf();
-    let helper_path = exe_dir.join("sandbox_helper_x86.exe");
+fn inject_via_helper(dll_path: &str, target_pid: DWORD, helper_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let helper = std::path::Path::new(helper_path);
 
-    if !helper_path.exists() {
-        // 回退：尝试直接注入（使用 64-bit 地址，虽然会失败）
-        log::warn!("sandbox_helper_x86.exe 未找到！WOW64 注入不可用");
-        return Err("sandbox_helper_x86.exe not found, WOW64 injection unavailable".into());
+    if !helper.exists() {
+        log::warn!("sandbox_helper_x86.exe 未找到: {}", helper_path);
+        return Err(format!("sandbox_helper_x86.exe not found: {}", helper_path).into());
     }
 
     // 构建命令行: helper.exe <target_pid> <dll_path>
     let cmdline = format!(
         "\"{}\" {} \"{}\"",
-        helper_path.to_string_lossy(),
+        helper.to_string_lossy(),
         target_pid,
         dll_path,
     );
