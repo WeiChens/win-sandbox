@@ -3,12 +3,6 @@
 use sandbox_core::SandboxConfig;
 use std::path::PathBuf;
 
-/// 直接使用提供的配置对象（库 API 使用）
-pub fn use_config(config: SandboxConfig) -> SandboxConfig {
-    log::info!("使用直接提供的沙箱配置: {}", config.name);
-    config
-}
-
 /// 加载沙箱配置
 ///
 /// 查找顺序：

@@ -260,7 +260,7 @@ pub fn read_pipe_to_end(h_pipe: HANDLE) -> String {
 /// 当管道关闭（子进程退出）或回调返回 `Err` 时停止读取并关闭句柄。
 pub fn read_pipe_stream<F>(h_pipe: usize, mut on_chunk: F)
 where
-    F: FnMut(Vec<u8>) -> Result<(), ()>,
+    F: FnMut(&[u8]) -> Result<(), ()>,
 {
     let pipe = h_pipe as HANDLE;
     let mut buf = vec![0u8; 4096];
@@ -272,7 +272,7 @@ where
         if ret == 0 || nread == 0 {
             break;
         }
-        if on_chunk(buf[..nread as usize].to_vec()).is_err() {
+        if on_chunk(&buf[..nread as usize]).is_err() {
             break; // 接收端已丢弃
         }
     }

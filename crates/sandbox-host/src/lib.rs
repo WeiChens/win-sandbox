@@ -83,8 +83,8 @@ impl SandboxStream {
     /// 等待执行完毕，收集所有输出为完整结果
     ///
     /// 等效于传统的阻塞式 `exec()`，但底层是流式的。
-    /// 如果中途 `Receiver` 被丢弃会 panic。
-    pub fn collect(self) -> SandboxResult {
+    /// 返回 `None` 表示通道在收到 `Done` 事件前已关闭（不应发生，除非进程被强制终止）。
+    pub fn collect(self) -> Option<SandboxResult> {
         let mut stdout = String::new();
         let mut stderr = String::new();
         for event in self.rx {
@@ -94,11 +94,11 @@ impl SandboxStream {
                 StreamEvent::Done(mut r) => {
                     r.stdout = stdout;
                     r.stderr = stderr;
-                    return r;
+                    return Some(r);
                 }
             }
         }
-        panic!("SandboxStream ended without Done event")
+        None
     }
 }
 
@@ -164,7 +164,7 @@ impl SandboxHost {
         timeout_secs: Option<u64>,
     ) -> Result<SandboxResult, Box<dyn std::error::Error>> {
         let stream = self.exec_streaming(command, args, config_path, timeout_secs)?;
-        Ok(stream.collect())
+        stream.collect().ok_or_else(|| "沙箱流意外结束（未收到 Done 事件）".into())
     }
 
     /// 在沙箱中执行命令（直接传入配置对象）
@@ -178,7 +178,7 @@ impl SandboxHost {
         timeout_secs: Option<u64>,
     ) -> Result<SandboxResult, Box<dyn std::error::Error>> {
         let stream = self.exec_with_config_streaming(command, args, config, timeout_secs)?;
-        Ok(stream.collect())
+        stream.collect().ok_or_else(|| "沙箱流意外结束（未收到 Done 事件）".into())
     }
 
     /// 在沙箱中执行命令，实时输出流
@@ -223,7 +223,6 @@ impl SandboxHost {
     ) -> Result<SandboxStream, Box<dyn std::error::Error>> {
         let cfg_path = config_path.map(|p| p.as_ref().to_path_buf());
         let sandbox_config = config::load_config(cfg_path)?;
-        let sandbox_config = config::use_config(sandbox_config);
         self.run_streaming(command, args, &sandbox_config, timeout_secs)
     }
 
@@ -235,8 +234,8 @@ impl SandboxHost {
         config: &sandbox_core::SandboxConfig,
         timeout_secs: Option<u64>,
     ) -> Result<SandboxStream, Box<dyn std::error::Error>> {
-        let sandbox_config = config::use_config(config.clone());
-        self.run_streaming(command, args, &sandbox_config, timeout_secs)
+        log::info!("沙箱配置: {}", config.name);
+        self.run_streaming(command, args, config, timeout_secs)
     }
 
     /// 内部：流式执行核心逻辑
@@ -279,29 +278,30 @@ impl SandboxHost {
 
         // ── stdout 读取线程（实时推送） ──
         let tx_out = tx.clone();
-        std::thread::spawn(move || {
+        let stdout_thread = std::thread::spawn(move || {
             inject::read_pipe_stream(stdout_h, |data| {
-                let text = String::from_utf8_lossy(&data).to_string();
+                let text = String::from_utf8_lossy(data).to_string();
                 tx_out.send(StreamEvent::Stdout(text)).map_err(|_| ())
             });
         });
 
         // ── stderr 读取线程（实时推送） ──
         let tx_err = tx.clone();
-        std::thread::spawn(move || {
+        let stderr_thread = std::thread::spawn(move || {
             inject::read_pipe_stream(stderr_h, |data| {
-                let text = String::from_utf8_lossy(&data).to_string();
+                let text = String::from_utf8_lossy(data).to_string();
                 tx_err.send(StreamEvent::Stderr(text)).map_err(|_| ())
             });
         });
 
         // ── 等待/超时线程 ──
-        // 负责：等待进程退出 → 刷审计 → 发送 Done 事件
-        // IpcServer 已 impl Send，可安全移入线程
+        // 负责：等待进程退出 → join reader 确保输出完整 → 刷审计 → 发送 Done 事件
+        // IpcServer 已 impl Send，JoinHandle<()> 也是 Send，可安全移入线程
         // process_handle 是 HANDLE(*mut c_void)，不是 Send，转为 usize
         let process_h = process_handle as usize;
         let timeout_ms = timeout_param.unwrap_or(0).max(1) * 1000;
         std::thread::spawn(move || {
+            // 1) 等待进程退出
             let process = process_h as *mut std::ffi::c_void;
             let exit_result = if timeout_ms > 0 {
                 inject::wait_for_process_timeout(process, process_id, timeout_ms as u32)
@@ -311,11 +311,14 @@ impl SandboxHost {
                     .map(|code| code as i32)
             };
 
+            // 2) join reader 线程（确保所有输出已被消费完再发 Done）
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+
+            // 3) 刷出审计事件并发送结果
             match exit_result {
                 Ok(exit_code) => {
                     log::info!("流式 PID={} 退出: {}", process_id, exit_code);
-
-                    // 刷出审计事件
                     ipc_server.flush_audit();
                     let audit_summary = ipc_server.summary();
 
@@ -370,3 +373,239 @@ pub fn run_sandbox(
 // 为测试代码重新导出
 #[doc(hidden)]
 pub use cli::*;
+
+// ============================================================================
+// 单元测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    // ── SandboxStream 测试 ────────────────────────────────────────────
+
+    #[test]
+    fn test_stream_collect_basic() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(StreamEvent::Stdout("hello ".into())).unwrap();
+        tx.send(StreamEvent::Stdout("world\n".into())).unwrap();
+        tx.send(StreamEvent::Stderr("err log\n".into())).unwrap();
+        tx.send(StreamEvent::Done(SandboxResult {
+            exit_code: 0, stdout: String::new(), stderr: String::new(),
+            audit_summary: "audit ok".into(), pid: 1234,
+        })).unwrap();
+
+        let result = SandboxStream { rx }.collect().expect("should have result");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "hello world\n");
+        assert_eq!(result.stderr, "err log\n");
+        assert_eq!(result.audit_summary, "audit ok");
+        assert_eq!(result.pid, 1234);
+    }
+
+    #[test]
+    fn test_stream_collect_no_stdout() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(StreamEvent::Stderr("only err".into())).unwrap();
+        tx.send(StreamEvent::Done(SandboxResult {
+            exit_code: 1, stdout: String::new(), stderr: String::new(),
+            audit_summary: "".into(), pid: 1,
+        })).unwrap();
+
+        let result = SandboxStream { rx }.collect().expect("should have result");
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.stdout, "");
+        assert_eq!(result.stderr, "only err");
+    }
+
+    #[test]
+    fn test_stream_collect_only_done() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(StreamEvent::Done(SandboxResult {
+            exit_code: 42, stdout: String::new(), stderr: String::new(),
+            audit_summary: "direct".into(), pid: 99,
+        })).unwrap();
+
+        let result = SandboxStream { rx }.collect().expect("should have result");
+        assert_eq!(result.exit_code, 42);
+        assert_eq!(result.audit_summary, "direct");
+        assert_eq!(result.pid, 99);
+    }
+
+    #[test]
+    fn test_stream_collect_empty_channel() {
+        let (_tx, rx) = mpsc::channel::<StreamEvent>();
+        drop(_tx);
+        assert!(SandboxStream { rx }.collect().is_none());
+    }
+
+    #[test]
+    fn test_stream_collect_first_done_wins() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(StreamEvent::Done(SandboxResult {
+            exit_code: 7, stdout: String::new(), stderr: String::new(),
+            audit_summary: "first".into(), pid: 1,
+        })).unwrap();
+        tx.send(StreamEvent::Done(SandboxResult {
+            exit_code: 8, stdout: String::new(), stderr: String::new(),
+            audit_summary: "second".into(), pid: 2,
+        })).unwrap();
+
+        let result = SandboxStream { rx }.collect().expect("should have result");
+        assert_eq!(result.exit_code, 7, "should stop at first Done");
+        assert_eq!(result.audit_summary, "first");
+    }
+
+    #[test]
+    fn test_stream_into_receiver() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(StreamEvent::Stdout("x".into())).unwrap();
+        drop(tx);
+
+        let stream = SandboxStream { rx };
+        let rx2 = stream.into_receiver();
+        let events: Vec<_> = rx2.iter().collect();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_stream_receiver_ref() {
+        let (_tx, rx) = mpsc::channel::<StreamEvent>();
+        let stream = SandboxStream { rx };
+        let _ = stream.receiver();
+    }
+
+    // ── SandboxHost 构建测试 ─────────────────────────────────────
+
+    #[test]
+    fn test_host_new_with_paths() {
+        let host = SandboxHost::new(
+            PathBuf::from("a.dll"),
+            PathBuf::from("b.dll"),
+            PathBuf::from("c.exe"),
+        );
+        assert_eq!(host.paths().dll_x64, PathBuf::from("a.dll"));
+        assert_eq!(host.paths().dll_x86, PathBuf::from("b.dll"));
+        assert_eq!(host.paths().helper_x86, PathBuf::from("c.exe"));
+    }
+
+    #[test]
+    fn test_host_with_paths_struct() {
+        let paths = SandboxPaths {
+            dll_x64: "x64.dll".into(),
+            dll_x86: "x86.dll".into(),
+            helper_x86: "helper.exe".into(),
+        };
+        let host = SandboxHost::with_paths(paths.clone());
+        assert_eq!(host.paths().dll_x64, PathBuf::from("x64.dll"));
+        assert_eq!(host.paths().dll_x86, PathBuf::from("x86.dll"));
+        assert_eq!(host.paths().helper_x86, PathBuf::from("helper.exe"));
+    }
+
+    #[test]
+    fn test_host_paths_read() {
+        let host = SandboxHost::new("a.dll", "b.dll", "c.exe");
+        let p = host.paths();
+        let _ = (&p.dll_x64, &p.dll_x86, &p.helper_x86);
+    }
+
+    // ── SandboxResult 序列化测试 ─────────────────────────────
+
+    #[test]
+    fn test_result_serialization() {
+        let r = SandboxResult {
+            exit_code: 42,
+            stdout: "out".into(),
+            stderr: "err".into(),
+            audit_summary: "audit".into(),
+            pid: 999,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"exit_code\":42"));
+        assert!(json.contains("\"pid\":999"));
+        assert!(json.contains("\"stdout\":\"out\""));
+    }
+
+    #[test]
+    fn test_result_clone_and_debug() {
+        let r = SandboxResult {
+            exit_code: 1, stdout: "a".into(), stderr: "b".into(),
+            audit_summary: "c".into(), pid: 2,
+        };
+        let r2 = r.clone();
+        assert_eq!(r2.exit_code, 1);
+        let _ = format!("{:?}", r2);
+    }
+
+    // ── 流事件类型测试 ─────────────────────────────────────────
+
+    #[test]
+    fn test_stream_event_variants() {
+        let s = StreamEvent::Stdout("out".into());
+        let e = StreamEvent::Stderr("err".into());
+        let d = StreamEvent::Done(SandboxResult {
+            exit_code: 0, stdout: String::new(), stderr: String::new(),
+            audit_summary: String::new(), pid: 0,
+        });
+        assert!(format!("{:?}", s).contains("Stdout"));
+        assert!(format!("{:?}", e).contains("Stderr"));
+        assert!(format!("{:?}", d).contains("Done"));
+    }
+
+    // ── 错误路径测试（不启动实际沙箱进程） ─────────────────────
+
+    #[test]
+    fn test_exec_nonexistent_config_returns_error() {
+        let host = SandboxHost::new("x.dll", "x.dll", "x.exe");
+        let result = host.exec(
+            "cmd.exe",
+            &Vec::<String>::new(),
+            Some(PathBuf::from("__no_such_config_file__.json")),
+            None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("不存在") || err.contains("__no_such_config_file__"));
+    }
+
+    #[test]
+    fn test_exec_streaming_nonexistent_config_returns_error() {
+        let host = SandboxHost::new("x.dll", "x.dll", "x.exe");
+        let result = host.exec_streaming(
+            "cmd.exe",
+            &Vec::<String>::new(),
+            Some(PathBuf::from("__no_such_config__.json")),
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_exec_with_config_nonexistent_dll_returns_error() {
+        let host = SandboxHost::new(
+            PathBuf::from("C:\\__nonexistent_hook_x64__.dll"),
+            PathBuf::from("C:\\__nonexistent_hook_x86__.dll"),
+            PathBuf::from("C:\\__nonexistent_helper__.exe"),
+        );
+        let config = sandbox_core::SandboxConfig::default();
+        let result = host.exec_with_config(
+            "cmd.exe",
+            &vec!["/c".into(), "echo test".into()],
+            &config,
+            Some(5),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_run_sandbox_free_function_nonexistent_config() {
+        let result = run_sandbox(
+            "cmd.exe",
+            &Vec::<String>::new(),
+            Some(PathBuf::from("__no_such_config__.json")),
+            None,
+        );
+        assert!(result.is_err());
+    }
+}
