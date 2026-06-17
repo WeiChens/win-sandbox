@@ -9,6 +9,19 @@
 //!   子进程中的 sandbox_hook.dll → Hook NtResumeThread → 自注入孙进程
 //!
 //! 这避免了 Failure-01 的 IPC-to-Host 瓶颈（CLR 崩溃的根因）。
+//!
+//! # 关于 FFI 命名风格
+//!
+//! 本模块包含大量 Windows API FFI 声明，结构体/字段命名遵循 Windows SDK 约定
+//! （如 `hProcess`、`dwProcessId`、`IMAGE_DOS_HEADER` 等），
+//! 以及保留下来的旧方案参考代码（PE 解析结构体）。
+//! 以下全局 allow 抑制这些预期的命名/死代码警告：
+
+#![allow(
+    non_camel_case_types,
+    non_snake_case,
+    dead_code
+)]
 
 use sandbox_core::SandboxConfig;
 use crate::ipc::IpcServer;
@@ -30,7 +43,6 @@ const CREATE_SUSPENDED: DWORD = 0x0000_0004;
 const INFINITE: DWORD = 0xFFFF_FFFF;
 const WAIT_OBJECT_0: DWORD = 0;
 const WAIT_TIMEOUT: DWORD = 0x00000102;
-const PROCESS_ALL_ACCESS: DWORD = 0x1F_0FFF;
 const MEM_COMMIT: DWORD = 0x0000_1000;
 const MEM_RESERVE: DWORD = 0x0000_2000;
 const MEM_RELEASE: DWORD = 0x0000_8000;
@@ -100,8 +112,6 @@ extern "system" {
                   lpAttr: *const c_void, nSize: DWORD) -> BOOL;
     fn ReadFile(hFile: HANDLE, lpBuf: *mut u8, nToRead: DWORD,
                 nRead: *mut DWORD, lpOverlapped: *mut c_void) -> BOOL;
-    fn PeekNamedPipe(hPipe: HANDLE, lpBuf: *mut u8, nBufSize: DWORD,
-                     nRead: *mut DWORD, nAvail: *mut DWORD, nLeft: *mut DWORD) -> BOOL;
 }
 
 const STARTF_USESTDHANDLES: DWORD = 0x0000_0100;
@@ -198,8 +208,6 @@ struct IMAGE_NT_HEADERS32 {
     optional_header: IMAGE_OPTIONAL_HEADER32,
 }
 
-fn invalid_handle() -> HANDLE { !0isize as HANDLE }
-
 // ============================================================================
 // 管道辅助函数
 // ============================================================================
@@ -227,14 +235,14 @@ pub fn create_pipe_pair() -> Result<((HANDLE, HANDLE), (HANDLE, HANDLE)), Box<dy
 }
 
 /// 从管道读取所有数据直到 EOF
-pub fn read_pipe_to_end(hPipe: HANDLE) -> String {
+pub fn read_pipe_to_end(h_pipe: HANDLE) -> String {
     let mut result = Vec::new();
     let mut buf = vec![0u8; 4096];
 
     loop {
         let mut nread: DWORD = 0;
         let ret = unsafe {
-            ReadFile(hPipe, buf.as_mut_ptr(), buf.len() as DWORD, &mut nread, std::ptr::null_mut())
+            ReadFile(h_pipe, buf.as_mut_ptr(), buf.len() as DWORD, &mut nread, std::ptr::null_mut())
         };
         if ret == 0 || nread == 0 {
             break;
@@ -242,7 +250,7 @@ pub fn read_pipe_to_end(hPipe: HANDLE) -> String {
         result.extend_from_slice(&buf[..nread as usize]);
     }
 
-    unsafe { CloseHandle(hPipe); }
+    unsafe { CloseHandle(h_pipe); }
     String::from_utf8_lossy(&result).to_string()
 }
 
@@ -311,7 +319,7 @@ fn get_wow64_loadlibraryw() -> Result<u32, Box<dyn std::error::Error>> {
         entry_point: *mut c_void,
     }
 
-    let kernel32: Vec<u16> = OsStr::new("kernel32.dll")
+    let _kernel32: Vec<u16> = OsStr::new("kernel32.dll")
         .encode_wide().chain(std::iter::once(0)).collect();
 
     let psapi_name: Vec<u16> = OsStr::new("psapi.dll")
@@ -787,20 +795,4 @@ fn set_hook_env_vars(ipc: &IpcServer, config: &SandboxConfig, dll_x64: &str, dll
     set_env("SBOX_AUDIT_SHM", ipc.audit_shm_name());  // ★ Ring Buffer 名称
 
     log::info!("沙箱环境变量已设置");
-}
-
-fn find_dll() -> Result<String, Box<dyn std::error::Error>> {
-    // 尝试多个可能路径
-    let candidates = [
-        "target/dll/x64/sandbox_hook.dll",
-        "../target/dll/x64/sandbox_hook.dll",
-        "../../target/dll/x64/sandbox_hook.dll",
-        "dll/sandbox-hook/build-x64/Release/sandbox_hook.dll",
-    ];
-    for path in &candidates {
-        if std::path::Path::new(path).exists() {
-            return Ok(path.to_string());
-        }
-    }
-    Err("找不到 sandbox_hook.dll".into())
 }

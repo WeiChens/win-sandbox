@@ -5,6 +5,7 @@ use std::path::PathBuf;
 #[derive(Debug)]
 pub struct CliArgs {
     pub command: Command,
+    #[allow(dead_code)]
     pub verbose: bool,
 }
 
@@ -25,10 +26,6 @@ pub enum Command {
     Audit {
         log_dir: Option<PathBuf>,
         format: AuditFormat,
-    },
-    /// 启动 AI 调用服务
-    Serve {
-        port: u16,
     },
 }
 
@@ -100,7 +97,6 @@ fn parse_from(args: &[String]) -> CliArgs {
         "exec" | "run" | "e" => parse_exec_from(args, verbose, subcmd_idx + 1, global_config, global_timeout),
         "config" | "cfg" | "c" => parse_config_from(args, verbose, subcmd_idx + 1),
         "audit" | "log" | "a" => parse_audit_from(args, verbose, subcmd_idx + 1),
-        "serve" | "s" => parse_serve_from(args, verbose, subcmd_idx + 1),
         "help" | "--help" | "-h" => {
             print_usage();
             std::process::exit(0);
@@ -193,12 +189,6 @@ fn parse_audit_from(args: &[String], verbose: bool, start: usize) -> CliArgs {
     CliArgs { command: Command::Audit { log_dir, format }, verbose }
 }
 
-fn parse_serve_from(args: &[String], verbose: bool, start: usize) -> CliArgs {
-    // serve 后面只有端口号
-    let port = args.get(start).and_then(|s| s.parse().ok()).unwrap_or(9800);
-    CliArgs { command: Command::Serve { port }, verbose }
-}
-
 /// 隐式 exec：无子命令时自动识别
 fn parse_exec_implicit(args: &[String], verbose: bool) -> CliArgs {
     let command = args[1].clone();
@@ -214,7 +204,7 @@ fn parse_exec_implicit(args: &[String], verbose: bool) -> CliArgs {
 }
 
 fn print_usage() {
-    println!(r#"Windows Sandbox — AI 可调用的沙盒终端
+    println!(r#"Windows Sandbox — 本地沙盒终端
 
 用法:
   sandbox-host [exec] <命令> [参数...]  [选项]    在沙箱中执行命令
@@ -222,7 +212,6 @@ fn print_usage() {
   sandbox-host config init [输出文件]              生成默认配置
   sandbox-host config validate <配置文件>          验证配置
   sandbox-host audit [--dir <目录>] [--json]       查看审计日志
-  sandbox-host serve [端口]                        启动 AI 调用服务
   sandbox-host help                                显示帮助
 
 选项:
@@ -234,7 +223,6 @@ fn print_usage() {
   sandbox-host exec cmd.exe /c dir C:\
   sandbox-host cmd.exe /c whoami
   sandbox-host --config strict.json python script.py
-  sandbox-host serve 9800
 "#);
 }
 
@@ -376,26 +364,6 @@ mod tests {
                 assert!(matches!(format, AuditFormat::Json));
             }
             _ => panic!("Expected Audit::Json"),
-        }
-    }
-
-    #[test]
-    fn test_serve_default_port() {
-        let a = args(&["serve"]);
-        let cli = parse_from(&a);
-        match cli.command {
-            Command::Serve { port } => assert_eq!(port, 9800),
-            _ => panic!("Expected Serve"),
-        }
-    }
-
-    #[test]
-    fn test_serve_custom_port() {
-        let a = args(&["serve", "3000"]);
-        let cli = parse_from(&a);
-        match cli.command {
-            Command::Serve { port } => assert_eq!(port, 3000),
-            _ => panic!("Expected Serve"),
         }
     }
 

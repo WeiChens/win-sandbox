@@ -2,7 +2,7 @@
 name = "sandbox-host"
 version = "0.1.0"
 edition = "2021"
-description = "Windows Sandbox — Rust host process (CLI + AI server)"
+description = "Windows Sandbox — Rust host process (local CLI)"
 
 [dependencies]
 sandbox-core = { path = "../sandbox-core" }
@@ -10,8 +10,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
 env_logger = "0.11"
-clap = { version = "4", features = ["derive"] }
-glob = "0.3"
-chrono = { version = "0.4", features = ["serde"] }
 
 

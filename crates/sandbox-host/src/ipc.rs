@@ -22,7 +22,6 @@ type BOOL = i32;
 
 const PAGE_READWRITE: DWORD = 0x04;
 const FILE_MAP_ALL_ACCESS: DWORD = 0xF001F;
-const FILE_MAP_READ: DWORD = 0x0004;
 
 extern "system" {
     fn CreateFileMappingW(hFile: HANDLE, lpAttr: *const c_void, flProtect: DWORD,
@@ -43,6 +42,7 @@ fn audit_shm_size() -> usize {
 
 pub struct IpcServer {
     /// Host PID
+    #[allow(dead_code)]
     host_pid: u32,
     /// 配置共享内存名称
     shm_name: String,
@@ -184,6 +184,7 @@ impl IpcServer {
 
     pub fn shm_name(&self) -> &str { &self.shm_name }
     pub fn audit_shm_name(&self) -> &str { &self.audit_shm_name }
+    #[allow(dead_code)]
     pub fn host_pid(&self) -> u32 { self.host_pid }
 
     /// 从 Ring Buffer 消费审计事件（多线程安全）
@@ -264,6 +265,7 @@ impl IpcServer {
         events
     }
 
+    #[allow(dead_code)]
     pub fn record_audit(&self, event: AuditEvent) {
         if let Ok(mut buf) = self.audit_buffer.lock() {
             buf.push(event);

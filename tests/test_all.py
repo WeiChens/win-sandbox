@@ -4,14 +4,13 @@ Windows Sandbox — 集成测试统一运行器
 ======================================
 
 运行全部测试套件：基础功能、文件 ACL、网络 ACL、递归注入、x86/WOW64、
-安全边界、路径健壮性、配置极端、AI API。
+CLR 兼容、安全边界、路径健壮性、配置极端。
 
 用法:
     python tests/test_all.py                          # 运行全部
     python tests/test_all.py --quick                  # 仅基础功能
     python tests/test_all.py --x64                    # 仅 x64 相关
     python tests/test_all.py --x86                    # 仅 x86 相关
-    python tests/test_all.py --no-ai                  # 跳过 AI API
     python tests/test_all.py --no-edge                # 跳过边缘测试
     python tests/test_all.py --security               # 仅安全边界
     python tests/test_all.py --path                   # 仅路径健壮性
@@ -36,7 +35,6 @@ from test_file_acl import FILE_ACL_TESTS
 from test_network import NETWORK_TESTS
 from test_recursive import RECURSIVE_TESTS
 from test_x86 import X86_TESTS
-from test_ai_api import AI_API_TESTS
 from test_clr import CLR_TESTS
 from test_edge import (
     EDGE_SECURITY_TESTS, EDGE_PATH_TESTS,
@@ -51,7 +49,6 @@ def main():
     parser.add_argument("--quick", action="store_true", help="仅运行基础功能")
     parser.add_argument("--x64", action="store_true", help="仅运行 x64 测试")
     parser.add_argument("--x86", action="store_true", help="仅运行 x86 测试")
-    parser.add_argument("--no-ai", action="store_true", help="跳过 AI API 测试")
     parser.add_argument("--no-edge", action="store_true", help="跳过边缘测试")
     parser.add_argument("--security", action="store_true", help="仅运行安全边界测试")
     parser.add_argument("--path", action="store_true", help="仅运行路径健壮性测试")
@@ -72,17 +69,17 @@ def main():
 
     # 专项运行
     if args.security:
-        suite.run_tests(EDGE_SECURITY_TESTS, "7. 安全边界")
+        suite.run_tests(EDGE_SECURITY_TESTS, "6. 安全边界")
         suite.print_summary()
         return 0 if _all_passed(suite) else 1
 
     if args.path:
-        suite.run_tests(EDGE_PATH_TESTS, "8. 路径健壮性")
+        suite.run_tests(EDGE_PATH_TESTS, "7. 路径健壮性")
         suite.print_summary()
         return 0 if _all_passed(suite) else 1
 
     if args.config_edge:
-        suite.run_tests(EDGE_CONFIG_TESTS, "9. 配置极端")
+        suite.run_tests(EDGE_CONFIG_TESTS, "8. 配置极端")
         suite.print_summary()
         return 0 if _all_passed(suite) else 1
 
@@ -98,7 +95,7 @@ def main():
         suite.run_tests(NETWORK_TESTS, "3. 网络 ACL")
         suite.run_tests(RECURSIVE_TESTS[:4], "4. 递归注入 (x64)")
         if not args.no_edge:
-            suite.run_tests(ALL_EDGE_TESTS, "7-9. 边缘场景")
+            suite.run_tests(ALL_EDGE_TESTS, "6-8. 边缘场景")
     elif args.x86:
         suite.run_tests(X86_TESTS, "5. x86/WOW64")
     else:
@@ -114,14 +111,8 @@ def main():
         # ── 5. x86/WOW64 ───────────────────────────────────────
         suite.run_tests(X86_TESTS, "5. x86/WOW64")
 
-        # ── 6. AI API ──────────────────────────────────────────
-        if not args.no_ai:
-            suite.run_tests(AI_API_TESTS, "6. AI API")
-        else:
-            print("\n⏭️  跳过 AI API 测试")
-
-        # ── 6.5. CLR 兼容 ──────────────────────────────────────
-        suite.run_tests(CLR_TESTS, "6.5. CLR 兼容")
+        # ── 6. CLR 兼容 ────────────────────────────────────────
+        suite.run_tests(CLR_TESTS, "6. CLR 兼容")
 
         # ── 7-9. 边缘场景 ──────────────────────────────────────
         if not args.no_edge:
@@ -199,12 +190,7 @@ def print_test_list():
         ("x86/WOW64", "x86", "5.3 x86 dir 系统目录"),
         ("x86/WOW64", "x86", "5.4 x86 文件写入 Inherit"),
         ("x86/WOW64", "x86", "5.5 x86 ReadOnly: 禁止写入"),
-        # 6. AI API
-        ("AI API", "x64", "6.1 /health 健康检查"),
-        ("AI API", "x64", "6.2 POST /exec 执行命令"),
-        ("AI API", "x64", "6.3 POST /exec 退出码"),
-        ("AI API", "x64", "6.4 GET /audit 审计"),
-        # 6.5. CLR 兼容
+        # 6. CLR 兼容
         ("CLR兼容", "x64", "CLR-1: PowerShell 基本输出"),
         ("CLR兼容", "x64", "CLR-2: PowerShell 列出目录"),
         ("CLR兼容", "x64", "CLR-3: PowerShell 复杂脚本"),

@@ -1,11 +1,10 @@
-//! sandbox-host — Windows 沙箱宿主进程
+//! sandbox-host — Windows 沙箱宿主进程（本地 CLI）
 
 mod cli;
 mod config;
 mod inject;
 mod ipc;
 mod audit;
-mod ai_server;
 
 use sandbox_core::SandboxConfig;
 use std::path::PathBuf;
@@ -41,16 +40,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli::Command::Audit { log_dir, format } => {
             audit::show_audit(log_dir, format)?;
         }
-        cli::Command::Serve { port } => {
-            ai_server::serve(port, run_sandbox)?;
-        }
     }
 
     Ok(())
 }
 
-/// 执行沙箱化命令（可复用，CLI 和 AI 共用）
-pub fn run_sandbox(
+/// 执行沙箱化命令
+fn run_sandbox(
     command: String,
     cmd_args: Vec<String>,
     config_path: Option<PathBuf>,

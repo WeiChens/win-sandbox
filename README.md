@@ -1,7 +1,7 @@
-# Windows Sandbox — AI 可调用的沙盒终端
+# Windows Sandbox — 本地沙盒终端
 
 > 一款轻量级 Windows 沙箱，通过 NT API 内联 Hook 实现文件系统/网络 ACL 控制。
-> 支持递归注入（子进程自动继承沙箱），专为 AI Agent 安全执行设计。
+> 支持递归注入（子进程自动继承沙箱）。
 
 ---
 
@@ -21,15 +21,14 @@ win-sandbox/
 │   │   │   ├── ffi.rs          # Windows FFI 常量
 │   │   │   └── lib.rs          # Crate 入口
 │   │   └── Cargo.toml
-│   └── sandbox-host/           # Rust 宿主进程（CLI + AI Server）
+│   └── sandbox-host/           # Rust 宿主进程（本地 CLI）
 │       ├── src/
-│       │   ├── main.rs         # 入口：Exec/Config/Audit/Serve 子命令
+│       │   ├── main.rs         # 入口：Exec/Config/Audit 子命令
 │       │   ├── cli.rs          # 命令行参数解析
 │       │   ├── inject.rs       # 进程创建 + DLL 注入（含 WOW64 辅助）
 │       │   ├── ipc.rs          # 共享内存管理 + Ring Buffer 消费
 │       │   ├── config.rs       # 配置加载
-│       │   ├── audit.rs        # 审计日志显示
-│       │   └── ai_server.rs    # AI HTTP 服务（调用沙箱执行）
+│       │   └── audit.rs        # 审计日志显示
 │       └── Cargo.toml
 ├── dll/
 │   ├── sandbox-hook/           # C++ 注入 DLL（核心沙箱引擎）
@@ -69,7 +68,7 @@ win-sandbox/
 ### 核心流程
 
 ```
-用户 / AI Agent
+用户 (CLI)
     │
     ▼
 sandbox-host.exe (Rust, x64)
@@ -235,26 +234,9 @@ sandbox-host.exe audit --json                   # JSON 格式
 sandbox-host.exe help
 ```
 
-### AI Server 模式
-
-```powershell
-# 启动 HTTP 服务（默认端口 9800）
-sandbox-host.exe serve
-
-# 指定端口
-sandbox-host.exe serve 3000
-```
-
-AI 调用示例：
-
-```bash
-# POST JSON: {"command":"cmd.exe","args":["/c","whoami"]}
-curl -X POST http://localhost:9800/exec \
-  -H "Content-Type: application/json" \
-  -d '{"command":"cmd.exe","args":["/c","whoami"]}'
-```
-
 ---
+
+
 
 ## 注入架构详解
 
@@ -380,11 +362,10 @@ python -m pytest tests/test_edge.py -v
 | **3. 网络 ACL** | 8 | ping/nslookup/curl, TCP 拒绝, DNS 拒绝/允许, 端口级屏蔽 |
 | **4. 递归注入** | 5 | 2层/3层/5层嵌套, 跨架构 x64→x86, 递归禁用 |
 | **5. x86/WOW64** | 5 | 基础命令, 文件写入, ReadOnly 写入拦截 |
-| **6. AI API** | 4 | /health, POST /exec, 退出码, /audit |
-| **7. 安全边界 🔴** | 4 | NtOpenFile+ReadOnly 回归, FILE_DELETE_ON_CLOSE+Deny 回归, 多硬链接防护, 符号链接防护 |
-| **8. 路径健壮性** | 4 | 中文/日文 Unicode 路径, 超长路径 >200 字符, 备用数据流 (ADS) |
-| **9. 配置极端** | 9 | 超时终止, 不存在/空命令, 禁用递归, 5 层深度递归, IPv6, 100 次快速创建删除, 空规则列表, Deny 深层目录 |
-| **总计** | **68** | **全场景覆盖** |
+| **6. 安全边界 🔴** | 4 | NtOpenFile+ReadOnly 回归, FILE_DELETE_ON_CLOSE+Deny 回归, 多硬链接防护, 符号链接防护 |
+| **7. 路径健壮性** | 4 | 中文/日文 Unicode 路径, 超长路径 >200 字符, 备用数据流 (ADS) |
+| **8. 配置极端** | 9 | 超时终止, 不存在/空命令, 禁用递归, 5 层深度递归, IPv6, 100 次快速创建删除, 空规则列表, Deny 深层目录 |
+| **总计** | **64** | **全场景覆盖** |
 
 ---
 
